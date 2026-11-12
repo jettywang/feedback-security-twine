@@ -176,6 +176,84 @@ def test_no_password_prompt_if_client_cert_and_non_interactive(entered_password)
     assert not settings_obj.password
 
 
+@pytest.mark.parametrize(
+    "settings_kwargs, match",
+    [
+        ({"cacert": "/no/such/ca.pem"}, "CA bundle"),
+        ({"client_cert": "/no/such/client.pem"}, "client certificate"),
+    ],
+)
+def test_validate_certificate_paths_raises_for_missing_file(
+    settings_kwargs, match
+):
+    """Raise before any request when a configured certificate path is missing."""
+    settings_obj = settings.Settings(
+        non_interactive=True, username="fakeuser", **settings_kwargs
+    )
+    with pytest.raises(exceptions.InvalidConfiguration, match=match):
+        settings_obj.validate_certificate_paths()
+
+
+def test_validate_certificate_paths_accepts_existing_files(tmp_path):
+    """Accept certificate paths that point to real files."""
+    cacert = tmp_path / "ca.pem"
+    client_cert = tmp_path / "client.pem"
+    cacert.write_text("ca")
+    client_cert.write_text("client")
+
+    settings_obj = settings.Settings(
+        non_interactive=True,
+        username="fakeuser",
+        cacert=str(cacert),
+        client_cert=str(client_cert),
+    )
+    # Should not raise.
+    settings_obj.validate_certificate_paths()
+
+
+def test_validate_certificate_paths_skips_unset_paths():
+    """Default (no certificate configured) passes validation."""
+    settings_obj = settings.Settings(non_interactive=True, username="fakeuser")
+    settings_obj.validate_certificate_paths()
+
+
+def test_create_repository_rejects_missing_certificate_before_request(monkeypatch):
+    """Fail in create_repository without constructing a request session."""
+    settings_obj = settings.Settings(
+        non_interactive=True,
+        username="fakeuser",
+        cacert="/no/such/ca.pem",
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Repository must not be created for a bad cert path")
+
+    monkeypatch.setattr(repository, "Repository", fail_if_called)
+
+    with pytest.raises(exceptions.InvalidConfiguration, match="CA bundle"):
+        settings_obj.create_repository()
+
+
+def test_create_repository_applies_configured_certificates(tmp_path):
+    """Pass configured certificate paths through to the created repository."""
+    cacert = tmp_path / "ca.pem"
+    client_cert = tmp_path / "client.pem"
+    cacert.write_text("ca")
+    client_cert.write_text("client")
+
+    settings_obj = settings.Settings(
+        non_interactive=True,
+        username="fakeuser",
+        password="password",
+        cacert=str(cacert),
+        client_cert=str(client_cert),
+    )
+    repo = settings_obj.create_repository()
+    assert repo.session.verify == str(cacert)
+    assert repo.session.cert == str(client_cert)
+    repo.close()
+
+
 class TestArgumentParsing:
     @staticmethod
     def parse_args(args):

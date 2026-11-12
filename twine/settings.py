@@ -16,6 +16,7 @@
 import argparse
 import contextlib
 import logging
+import os
 from typing import Any, Optional, cast
 
 from twine import auth
@@ -313,6 +314,26 @@ class Settings:
         self.cacert = utils.get_cacert(cacert, self.repository_config)
         self.client_cert = utils.get_clientcert(client_cert, self.repository_config)
 
+    def validate_certificate_paths(self) -> None:
+        """Verify any configured CA bundle and client certificate exist.
+
+        The paths are checked up front so that a typo or missing file is
+        reported before any network request (and therefore before the first
+        package is uploaded), rather than surfacing as a low-level TLS error
+        partway through an upload.
+
+        :raises twine.exceptions.InvalidConfiguration:
+            A configured certificate path does not point to an existing file.
+        """
+        for label, path in (
+            ("CA bundle", self.cacert),
+            ("client certificate", self.client_cert),
+        ):
+            if path and not os.path.isfile(path):
+                raise exceptions.InvalidConfiguration(
+                    f"Unable to find the {label} file: {path}"
+                )
+
     def verify_feature_capability(self) -> None:
         """Verify configured settings are supported for the configured repository.
 
@@ -349,6 +370,9 @@ class Settings:
 
     def create_repository(self) -> repository.Repository:
         """Create a new repository for uploading."""
+        # Fail fast on a missing CA bundle or client certificate before any
+        # network request is made (i.e. before the first package upload).
+        self.validate_certificate_paths()
         repo = repository.Repository(
             cast(str, self.repository_config["repository"]),
             self.username,

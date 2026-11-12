@@ -43,6 +43,10 @@ class Repository:
         self.url = repository_url
 
         self.session = make_requests_session()
+        # ``verify`` defaults to True, which keeps TLS certificate verification
+        # enabled when no custom CA bundle is configured. Set it explicitly so
+        # the value is observable on the session for every request it makes.
+        self.session.verify = True
         # requests.Session.auth should be Union[None, Tuple[str, str], ...]
         # But username or password could be None
         # See TODO for utils.RepositoryConfig

@@ -100,6 +100,127 @@ def test_set_certificate_authority(default_repo):
     assert default_repo.session.verify == "/path/to/cert"
 
 
+def test_default_verification_remains_enabled_without_cert():
+    """Keep TLS verification enabled when no CA bundle is supplied."""
+    repo = repository.Repository(
+        repository_url=utils.DEFAULT_REPOSITORY,
+        username="username",
+        password="password",
+    )
+    # No custom CA configured, so the default (verifying) behavior must hold.
+    assert repo.session.verify is True
+    assert repo.session.cert is None
+
+
+class RecordingSession:
+    """Fake requests session recording the TLS options on each request.
+
+    Both of the repository's request entry points (the pre-upload GET used by
+    ``package_is_uploaded`` and the POST used by ``_upload``) run through this
+    object, allowing a test to assert they carry identical TLS configuration.
+    """
+
+    def __init__(self) -> None:
+        self.verify = True
+        self.cert = None
+        self.headers = {"User-Agent": "twine/test"}
+        self.auth = None
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(("get", url, self.verify, self.cert))
+        resp = requests.Response()
+        resp.status_code = 404
+        return resp
+
+    def post(self, url, **kwargs):
+        self.calls.append(("post", url, self.verify, self.cert))
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.reason = "OK"
+        return resp
+
+    def mount(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_tls_options_are_shared_by_both_request_entry_points(tmpdir):
+    """Apply the same verify/cert settings to the pre-upload GET and upload POST."""
+    cacert = "/path/to/custom-ca.pem"
+    client_cert = "/path/to/client.pem"
+
+    repo = repository.Repository(
+        repository_url=utils.DEFAULT_REPOSITORY,
+        username="username",
+        password="password",
+        disable_progress_bar=True,
+    )
+    repo.session = RecordingSession()
+    repo.set_certificate_authority(cacert)
+    repo.set_client_certificate(client_cert)
+
+    package = pretend.stub(safe_name="fake", version="2.12.0")
+    repo.package_is_uploaded(package, bypass_cache=True)
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+    upload_package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+    repo.upload(upload_package)
+
+    assert repo.session.calls == [
+        ("get", f"{repository.LEGACY_PYPI}pypi/fake/json", cacert, client_cert),
+        ("post", utils.DEFAULT_REPOSITORY, cacert, client_cert),
+    ]
+    # The session itself retains the configured TLS state.
+    assert repo.session.verify == cacert
+    assert repo.session.cert == client_cert
+
+
+def test_both_request_entry_points_use_default_verification_when_unset(tmpdir):
+    """Record default verification on the GET and POST when no files are set."""
+    repo = repository.Repository(
+        repository_url=utils.DEFAULT_REPOSITORY,
+        username="username",
+        password="password",
+        disable_progress_bar=True,
+    )
+    repo.session = RecordingSession()
+    # Explicitly exercise the "nothing configured" path.
+    repo.set_certificate_authority(None)
+    repo.set_client_certificate(None)
+
+    repo.package_is_uploaded(
+        pretend.stub(safe_name="fake", version="2.12.0"), bypass_cache=True
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+    upload_package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+    repo.upload(upload_package)
+
+    assert repo.session.calls == [
+        ("get", f"{repository.LEGACY_PYPI}pypi/fake/json", True, None),
+        ("post", utils.DEFAULT_REPOSITORY, True, None),
+    ]
+    assert repo.session.verify is True
+    assert repo.session.cert is None
+
+
 def test_make_user_agent_string(default_repo):
     """Add twine to User-Agent session header."""
     assert "twine/" in default_repo.session.headers["User-Agent"]
