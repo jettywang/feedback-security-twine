@@ -123,6 +123,16 @@ PyPI.
 
 .. program-output:: twine check -h
 
+``twine diagnose``
+^^^^^^^^^^^^^^^^^^
+
+Explains which repository an upload would target and which configuration
+source (command line, environment variable, or config file section) decided
+it. Useful as a pre-flight check in CI, e.g. when migrating ``.pypirc``
+section names. No credentials are loaded or displayed.
+
+.. program-output:: twine diagnose -h
+
 Configuration
 -------------
 
