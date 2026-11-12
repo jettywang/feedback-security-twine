@@ -1,0 +1,3 @@
+Add a local, offline ``twine attest`` command that shows which distribution
+each ``*.attestation`` file will be attached to using the same matching rules
+as the upload, and flags orphaned files and ambiguous prefix matches.

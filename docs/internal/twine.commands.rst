@@ -6,5 +6,6 @@ twine.commands package
 .. toctree::
    :maxdepth: 4
 
+   twine.commands.attest
    twine.commands.check
    twine.commands.upload

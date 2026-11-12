@@ -26,6 +26,13 @@ from twine import exceptions
 
 __all__: List[str] = []
 
+# Filename patterns used to classify the unstructured list of files passed on
+# the command line. They are the single source of truth for what Twine treats
+# as a signature or attestation, so other commands (e.g. the local attestation
+# pre-check) can reuse them instead of re-deriving the matching rules.
+SIGNATURE_GLOB = "*.asc"
+ATTESTATION_GLOB = "*.*.attestation"
+
 
 def _group_wheel_files_first(files: List[str]) -> List[str]:
     if not any(fname for fname in files if fname.endswith(".whl")):
@@ -75,19 +82,35 @@ def _split_inputs(
     dict of ``basename -> path``, and attestations are returned as a dict of
     ``dist-path -> [attestation-path]``.
     """
-    signatures = {os.path.basename(i): i for i in fnmatch.filter(inputs, "*.asc")}
-    attestations = fnmatch.filter(inputs, "*.*.attestation")
+    signatures = {
+        os.path.basename(i): i for i in fnmatch.filter(inputs, SIGNATURE_GLOB)
+    }
+    attestations = fnmatch.filter(inputs, ATTESTATION_GLOB)
     dists = [
         dist
         for dist in inputs
         if dist not in (set(signatures.values()) | set(attestations))
     ]
 
-    attestations_by_dist = {}
-    for dist in dists:
-        dist_basename = os.path.basename(dist)
-        attestations_by_dist[dist] = [
-            a for a in attestations if os.path.basename(a).startswith(dist_basename)
+    attestations_by_dist = {
+        dist: [
+            a
+            for a in attestations
+            if attestation_matches_dist(os.path.basename(a), os.path.basename(dist))
         ]
+        for dist in dists
+    }
 
     return Inputs(dists, signatures, attestations_by_dist)
+
+
+def attestation_matches_dist(attestation_basename: str, dist_basename: str) -> bool:
+    """Return whether an attestation file is associated with a distribution.
+
+    This is the exact association rule used while uploading: an attestation is
+    attached to a distribution when its basename begins with the distribution's
+    basename. Because the check is a plain prefix, a single attestation can be
+    associated with more than one distribution when one distribution's
+    basename is itself a prefix of another's.
+    """
+    return attestation_basename.startswith(dist_basename)

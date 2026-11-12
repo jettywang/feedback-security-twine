@@ -123,6 +123,18 @@ PyPI.
 
 .. program-output:: twine check -h
 
+``twine attest``
+^^^^^^^^^^^^^^^^
+
+Performs a local, offline pre-flight check of the ``*.attestation`` files in a
+release directory. It shows which distribution each attestation will actually
+be uploaded with, using the same matching rules as ``twine upload``, and flags
+orphaned attestations, distributions without attestations, and attestations
+that prefix-match more than one distribution. Nothing is uploaded and no
+credentials are required.
+
+.. program-output:: twine attest -h
+
 Configuration
 -------------
 
