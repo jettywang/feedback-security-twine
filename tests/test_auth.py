@@ -1,5 +1,6 @@
 import base64
 import getpass
+import json
 import logging
 import platform
 import re
@@ -8,6 +9,7 @@ import typing as t
 
 import pytest
 import requests.auth
+from id import AmbientCredentialError
 
 from twine import auth
 from twine import exceptions
@@ -455,3 +457,324 @@ def test_inability_to_make_token_raises_error():
     )
     with pytest.raises(exceptions.TrustedPublishingFailure):
         authenticator(None)
+
+
+class RecordingKeyring:
+    """Fake keyring that records every lookup instead of returning a secret."""
+
+    def __init__(self) -> None:
+        self.calls: t.List[t.Tuple[str, str, t.Any]] = []
+
+    def get_credential(self, system, user):
+        self.calls.append(("get_credential", system, user))
+        return None
+
+    def get_password(self, system, user):
+        self.calls.append(("get_password", system, user))
+        return None
+
+
+def _pypi_config() -> utils.RepositoryConfig:
+    return dict(repository=utils.TEST_REPOSITORY)
+
+
+def _minting_session(
+    get_responses: t.Optional[t.List[MockResponse]] = None,
+    post_responses: t.Optional[t.List[MockResponse]] = None,
+) -> t.Callable[[], MockSession]:
+    get_responses = get_responses or [
+        MockResponse(status_code=200, json={"audience": "fake-aud"})
+    ]
+    post_responses = post_responses or [
+        MockResponse(
+            status_code=200,
+            json={
+                "success": True,
+                "token": "minted-tp-token",
+                "expires": int(time.time()) + 900,
+            },
+        )
+    ]
+
+    def make_session() -> MockSession:
+        return MockSession(
+            get_response_list=list(get_responses),
+            post_response_list=list(post_responses),
+        )
+
+    return make_session
+
+
+def _restricted_resolver(
+    config: utils.RepositoryConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    **input_kwargs: t.Any,
+) -> auth.Resolver:
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(
+            input_kwargs.pop("get_responses", None),
+            input_kwargs.pop("post_responses", None),
+        ),
+    )
+    monkeypatch.setattr(auth, "detect_credential", lambda *a, **k: "fake-oidc-token")
+    return auth.Resolver(
+        config,
+        auth.CredentialInput(**input_kwargs),
+        credential_source=auth.TRUSTED_PUBLISHING,
+    )
+
+
+def test_credential_source_restriction_mints_token_without_keyring(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, "twine")
+    keyring = RecordingKeyring()
+    monkeypatch.setattr(auth, "keyring", keyring)
+    resolver = _restricted_resolver(_pypi_config(), monkeypatch)
+
+    assert resolver.username == "__token__"
+    assert resolver.password == "minted-tp-token"
+    assert keyring.calls == []
+    assert "keyring and prompts are disabled" in caplog.text
+
+
+def test_credential_source_restriction_uses_token_authenticator(monkeypatch):
+    resolver = _restricted_resolver(_pypi_config(), monkeypatch)
+    assert isinstance(resolver.authenticator, auth.TrustedPublishingAuthenticator)
+
+
+def test_credential_source_restriction_ignores_keyring_password(monkeypatch):
+    keyring = RecordingKeyring()
+    monkeypatch.setattr(auth, "keyring", keyring)
+    resolver = _restricted_resolver(_pypi_config(), monkeypatch)
+
+    assert resolver.password == "minted-tp-token"
+    assert keyring.calls == []
+
+
+def test_credential_source_restriction_rejects_static_password(monkeypatch):
+    monkeypatch.setattr(auth, "keyring", RecordingKeyring())
+    resolver = _restricted_resolver(
+        _pypi_config(), monkeypatch, username="__token__", password="fallback-secret"
+    )
+    with pytest.raises(exceptions.InvalidConfiguration, match="credential source"):
+        resolver.password
+
+
+def test_credential_source_restriction_rejects_config_password(monkeypatch):
+    config = _pypi_config()
+    config["password"] = "pypirc-secret"
+    resolver = _restricted_resolver(config, monkeypatch)
+    with pytest.raises(exceptions.InvalidConfiguration, match="credential source"):
+        resolver.password
+
+
+def test_credential_source_restriction_unsupported_repository(monkeypatch):
+    resolver = _restricted_resolver(
+        dict(repository="https://upload.example.org/legacy/"), monkeypatch
+    )
+    with pytest.raises(exceptions.InvalidConfiguration, match="only supported"):
+        resolver.password
+
+
+def test_credential_source_restriction_fails_at_audience_stage(monkeypatch):
+    resolver = _restricted_resolver(
+        _pypi_config(),
+        monkeypatch,
+        get_responses=[MockResponse(status_code=503, json={})],
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_AUDIENCE
+    assert exc_info.value.source == auth.TRUSTED_PUBLISHING
+
+
+def test_credential_source_restriction_fails_at_oidc_stage(monkeypatch):
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(),
+    )
+
+    def no_ambient_credential(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(auth, "detect_credential", no_ambient_credential)
+    resolver = auth.Resolver(
+        _pypi_config(),
+        auth.CredentialInput(),
+        credential_source=auth.TRUSTED_PUBLISHING,
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_OIDC_TOKEN
+
+
+def test_credential_source_restriction_ambient_error_reports_oidc_stage(monkeypatch):
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(),
+    )
+
+    def raise_ambient_error(*args, **kwargs) -> str:
+        raise AmbientCredentialError("CI platform rejected the request")
+
+    monkeypatch.setattr(auth, "detect_credential", raise_ambient_error)
+    resolver = auth.Resolver(
+        _pypi_config(),
+        auth.CredentialInput(),
+        credential_source=auth.TRUSTED_PUBLISHING,
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_OIDC_TOKEN
+    assert "CI platform rejected" in str(exc_info.value)
+
+
+def test_credential_source_restriction_fails_at_exchange_stage(monkeypatch):
+    resolver = _restricted_resolver(
+        _pypi_config(),
+        monkeypatch,
+        post_responses=[
+            MockResponse(
+                status_code=403,
+                json={
+                    "errors": [
+                        {
+                            "code": "invalid-token",
+                            "description": "the OIDC token was not accepted",
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_TOKEN_EXCHANGE
+    assert "invalid-token" in str(exc_info.value)
+
+
+def test_credential_source_restriction_fails_at_response_stage(monkeypatch):
+    class InvalidJsonResponse(MockResponse):
+        def json(self, *args, **kwargs) -> t.Any:
+            raise json.JSONDecodeError("Expecting value", "doc", 0)
+
+    resolver = _restricted_resolver(
+        _pypi_config(),
+        monkeypatch,
+        post_responses=[InvalidJsonResponse(status_code=200, json={})],
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_TOKEN_RESPONSE
+
+
+def test_credential_source_restriction_never_prompts(monkeypatch):
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(
+            get_responses=[MockResponse(status_code=500, json={})],
+        ),
+    )
+    monkeypatch.setattr(auth, "detect_credential", lambda *a, **k: "fake-oidc-token")
+
+    def fail_prompt(*args, **kwargs) -> str:
+        raise AssertionError("a prompt should never be reached")
+
+    monkeypatch.setattr(auth.getpass, "getpass", fail_prompt)
+    monkeypatch.setattr(auth, "input", fail_prompt, raising=False)
+
+    resolver = auth.Private(
+        _pypi_config(),
+        auth.CredentialInput(),
+        credential_source=auth.TRUSTED_PUBLISHING,
+    )
+    with pytest.raises(exceptions.CredentialSourceUnavailable) as exc_info:
+        resolver.password
+    assert exc_info.value.stage == auth.STAGE_AUDIENCE
+
+
+def test_unknown_credential_source_rejected(config):
+    with pytest.raises(exceptions.InvalidConfiguration, match="Unsupported"):
+        auth.Resolver(
+            config,
+            auth.CredentialInput(),
+            credential_source="keyring",
+        )
+
+
+def test_default_lookup_order_prefers_keyring_over_trusted_publishing(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, "twine")
+    keyring = RecordingKeyring()
+
+    class KeyringWithSecret(RecordingKeyring):
+        def get_password(self, system, user):
+            super().get_password(system, user)
+            return "keyring-secret"
+
+    recording = KeyringWithSecret()
+    monkeypatch.setattr(auth, "keyring", recording)
+
+    def fail_session() -> MockSession:
+        raise AssertionError("trusted publishing must not be attempted")
+
+    monkeypatch.setattr(auth.utils, "make_requests_session", fail_session)
+
+    resolver = auth.Resolver(_pypi_config(), auth.CredentialInput("__token__"))
+    assert resolver.password == "keyring-secret"
+    assert recording.calls == [("get_password", utils.TEST_REPOSITORY, "__token__")]
+    assert "password set from keyring" in caplog.messages
+
+
+def test_default_lookup_order_falls_back_to_trusted_publishing(monkeypatch):
+    monkeypatch.setattr(auth, "keyring", RecordingKeyring())
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(),
+    )
+    monkeypatch.setattr(auth, "detect_credential", lambda *a, **k: "fake-oidc-token")
+
+    resolver = auth.Resolver(_pypi_config(), auth.CredentialInput("__token__"))
+    assert resolver.password == "minted-tp-token"
+
+
+def test_default_lookup_order_without_restriction_prompts(
+    monkeypatch, entered_password
+):
+    monkeypatch.setattr(auth, "keyring", RecordingKeyring())
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(),
+    )
+
+    def no_ambient_credential(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(auth, "detect_credential", no_ambient_credential)
+
+    resolver = auth.Resolver(_pypi_config(), auth.CredentialInput("__token__"))
+    assert resolver.password == "entered pw"
+
+
+def test_unrestricted_failure_keeps_trusted_publishing_failure(monkeypatch):
+    monkeypatch.setattr(
+        auth.utils,
+        "make_requests_session",
+        _minting_session(
+            get_responses=[MockResponse(status_code=503, json={})],
+        ),
+    )
+    monkeypatch.setattr(auth, "detect_credential", lambda *a, **k: "fake-oidc-token")
+
+    resolver = auth.Resolver(_pypi_config(), auth.CredentialInput("__token__"))
+    with pytest.raises(requests.exceptions.HTTPError):
+        resolver.password

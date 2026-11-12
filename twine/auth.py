@@ -40,6 +40,19 @@ TOKEN_RENEWAL_THRESHOLD: t.Final[datetime.timedelta] = datetime.timedelta(
     minutes=5,
 )
 
+#: Credential source restricting resolution to trusted publishing, i.e. the
+#: short-lived token minted through the repository's OIDC exchange endpoints.
+TRUSTED_PUBLISHING: t.Final[str] = "trusted-publishing"
+#: Supported values for the credential source restriction. ``None`` means no
+#: restriction, preserving the historical keyring/prompt lookup order.
+CREDENTIAL_SOURCES: t.Final[t.Tuple[str, ...]] = (TRUSTED_PUBLISHING,)
+
+#: Stages reported by :class:`exceptions.CredentialSourceUnavailable`.
+STAGE_AUDIENCE: t.Final[str] = "oidc-audience"
+STAGE_OIDC_TOKEN: t.Final[str] = "oidc-token"
+STAGE_TOKEN_EXCHANGE: t.Final[str] = "token-exchange"
+STAGE_TOKEN_RESPONSE: t.Final[str] = "token-response"
+
 
 class CredentialInput:
     def __init__(
@@ -96,9 +109,33 @@ class Resolver:
         self,
         config: utils.RepositoryConfig,
         input: CredentialInput,
+        credential_source: t.Optional[str] = None,
     ) -> None:
+        if (
+            credential_source is not None
+            and credential_source not in CREDENTIAL_SOURCES
+        ):
+            raise exceptions.InvalidConfiguration(
+                f"Unsupported credential source {credential_source!r}; "
+                f"expected one of: {', '.join(CREDENTIAL_SOURCES)}"
+            )
         self.config = config
         self.input = input
+        self.credential_source = credential_source
+
+    @property
+    def requires_trusted_publishing(self) -> bool:
+        """Whether resolution is restricted to trusted publishing."""
+        return self.credential_source == TRUSTED_PUBLISHING
+
+    def _credential_source_unavailable(
+        self, stage: str, detail: t.Optional[str] = None
+    ) -> "exceptions.CredentialSourceUnavailable":
+        return exceptions.CredentialSourceUnavailable(
+            source=cast(str, self.credential_source),
+            stage=stage,
+            detail=detail,
+        )
 
     @property
     @functools.lru_cache()
@@ -128,6 +165,12 @@ class Resolver:
     @property
     @functools.lru_cache()
     def username(self) -> t.Optional[str]:
+        if self.requires_trusted_publishing:
+            # Trusted publishing always authenticates as the token user; never
+            # consult the keyring or an interactive prompt for a username.
+            self.input.username = TOKEN_USERNAME
+            return TOKEN_USERNAME
+
         if self.is_pypi() and not self.input.username:
             # Default username.
             self.input.username = TOKEN_USERNAME
@@ -142,11 +185,22 @@ class Resolver:
     @property
     @functools.lru_cache()
     def password(self) -> t.Optional[str]:
+        if self.requires_trusted_publishing and (
+            self.input.password or self.config.get("password")
+        ):
+            # Fail closed before get_userpass_value can return the static
+            # password: a restricted job must not use a keyring-backed,
+            # environment, or .pypirc password instead of a minted token.
+            raise exceptions.InvalidConfiguration(
+                "A password was provided but credential source is restricted "
+                f"to {self.credential_source!r}; remove the password so only "
+                "trusted publishing is used"
+            )
         return utils.get_userpass_value(
             self.input.password,
             self.config,
             key="password",
-            prompt_strategy=self.password_from_keyring_or_trusted_publishing_or_prompt,
+            prompt_strategy=self.password_from_allowed_credential_source,
         )
 
     def _has_valid_cached_tp_token(self) -> bool:
@@ -166,15 +220,22 @@ class Resolver:
         # Indices are expected to support `https://{domain}/_/oidc/audience`,
         # which tells OIDC exchange clients which audience to use.
         audience_url = f"https://{repository_domain}/_/oidc/audience"
-        resp = session.get(audience_url, timeout=5)
-        resp.raise_for_status()
-        audience = cast(str, resp.json()["audience"])
+        try:
+            resp = session.get(audience_url, timeout=5)
+            resp.raise_for_status()
+            audience = cast(str, resp.json()["audience"])
+        except (requests.RequestException, KeyError, ValueError) as exc:
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(STAGE_AUDIENCE, str(exc))
+            raise
 
         try:
             oidc_token = detect_credential(audience)
         except AmbientCredentialError as e:
             # If we get here, we're on a supported CI platform for trusted
             # publishing, and we have not been given any token, so we can error.
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(STAGE_OIDC_TOKEN, str(e))
             raise exceptions.TrustedPublishingFailure(
                 "Unable to retrieve an OIDC token from the CI platform for "
                 f"trusted publishing {e}"
@@ -182,26 +243,44 @@ class Resolver:
 
         if oidc_token is None:
             logger.warning("This environment is not supported for trusted publishing")
-            if self._tp_token and int(time.time()) > cast(
+            if self._tp_token and int(time.time()) <= cast(
                 int, self._tp_token.get("expires", self._expires)
             ):
-                return None  # Fall back to prompting for a token (if possible)
-            # The cached trusted publishing token may still be valid for a
-            # while longer, let's continue using it instead of prompting
-            return self._tp_token
+                # The cached trusted publishing token may still be valid for a
+                # while longer, let's continue using it instead of prompting.
+                return self._tp_token
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(
+                    STAGE_OIDC_TOKEN,
+                    "no ambient OIDC credential was detected",
+                )
+            # Fall back to prompting for a token (if possible).
+            return None
 
         logger.warning("Got OIDC token for audience %s", audience)
 
         token_exchange_url = f"https://{repository_domain}/_/oidc/mint-token"
 
-        mint_token_resp = session.post(
-            token_exchange_url,
-            json={"token": oidc_token},
-            timeout=5,  # S113 wants a timeout
-        )
+        try:
+            mint_token_resp = session.post(
+                token_exchange_url,
+                json={"token": oidc_token},
+                timeout=5,  # S113 wants a timeout
+            )
+        except requests.RequestException as exc:
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(
+                    STAGE_TOKEN_EXCHANGE, str(exc)
+                )
+            raise
         try:
             mint_token_payload = mint_token_resp.json()
         except json.JSONDecodeError:
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(
+                    STAGE_TOKEN_RESPONSE,
+                    "the token-minting request returned invalid JSON",
+                )
             raise exceptions.TrustedPublishingFailure(
                 "The token-minting request returned invalid JSON"
             )
@@ -211,6 +290,11 @@ class Resolver:
                 f"* `{error['code']}`: {error['description']}"
                 for error in mint_token_payload["errors"]
             )
+            if self.requires_trusted_publishing:
+                raise self._credential_source_unavailable(
+                    STAGE_TOKEN_EXCHANGE,
+                    f"the index rejected the token request:\n\n{reasons}",
+                )
             raise exceptions.TrustedPublishingFailure(
                 "The token request failed; the index server gave the following"
                 f" reasons:\n\n{reasons}"
@@ -288,6 +372,31 @@ class Resolver:
         what = "API token" if self.is_pypi() else "password"
 
         return self.prompt(what, getpass.getpass)
+
+    def password_from_allowed_credential_source(self) -> str:
+        """Resolve a password honoring any explicit credential source restriction."""
+        if self.requires_trusted_publishing:
+            if not self.is_pypi():
+                raise exceptions.InvalidConfiguration(
+                    f"Credential source {self.credential_source!r} is only "
+                    "supported for PyPI and TestPyPI"
+                )
+            # Keyring and interactive prompts are intentionally never consulted
+            # in this branch, so a missing token stops the unattended job.
+            logger.info(
+                "Resolving password exclusively from trusted publishing "
+                "(keyring and prompts are disabled by the credential source "
+                "restriction)"
+            )
+            token = self.make_trusted_publishing_token()
+            if token is None:
+                raise self._credential_source_unavailable(
+                    STAGE_OIDC_TOKEN,
+                    "no trusted publishing token was returned",
+                )
+            return token
+
+        return self.password_from_keyring_or_trusted_publishing_or_prompt()
 
     def prompt(self, what: str, how: t.Callable[..., str]) -> str:
         return how(f"Enter your {what}: ")

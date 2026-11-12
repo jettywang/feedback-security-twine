@@ -61,6 +61,7 @@ class Settings:
         repository_url: Optional[str] = None,
         verbose: bool = False,
         disable_progress_bar: bool = False,
+        credential_source: Optional[str] = None,
         **ignored_kwargs: Any,
     ) -> None:
         """Initialize our settings instance.
@@ -107,6 +108,12 @@ class Settings:
             Show verbose output.
         :param disable_progress_bar:
             Disable the progress bar.
+        :param credential_source:
+            Restrict credential resolution to the named source, e.g.
+            ``"trusted-publishing"``. When set, other sources such as the
+            keyring or interactive prompts are not used, and the job fails if
+            the required source is unavailable. ``None`` preserves the default
+            lookup order.
         """
         self.config_file = config_file
         self.comment = comment
@@ -128,6 +135,7 @@ class Settings:
         self.auth = auth.Resolver.choose(not non_interactive)(
             self.repository_config,
             auth.CredentialInput(username, password),
+            credential_source=credential_source,
         )
 
     @property
@@ -229,6 +237,21 @@ class Settings:
             help="Do not interactively prompt for username/password if the "
             "required credentials are missing. (Can also be set via "
             "%(env)s environment variable.)",
+        )
+        parser.add_argument(
+            "--credential-source",
+            action=utils.EnvironmentDefault,
+            env="TWINE_CREDENTIAL_SOURCE",
+            default=None,
+            required=False,
+            choices=list(auth.CREDENTIAL_SOURCES),
+            help="Restrict credentials to the given source. With "
+            "'trusted-publishing', Twine only uses the short-lived token "
+            "obtained via OpenID Connect trusted publishing; it does not read "
+            "a keyring or prompt for a password, and it fails at the first "
+            "unavailable exchange stage. When unset, the default keyring, "
+            "trusted publishing, and prompt lookup order is retained. "
+            "(Can also be set via %(env)s environment variable.)",
         )
         parser.add_argument(
             "-c",

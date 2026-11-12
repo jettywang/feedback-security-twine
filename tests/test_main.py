@@ -17,6 +17,7 @@ import pytest
 import requests
 
 from twine import __main__ as dunder_main
+from twine import exceptions
 from twine.commands import upload
 
 # Hard-coding control characters for red text; couldn't find a succinct alternative
@@ -85,6 +86,37 @@ def test_no_color_exception(monkeypatch, capsys):
     assert _unwrap_lines(captured.out) == (
         f"{PLAIN_ERROR} InvalidDistribution: Cannot find file (or expand pattern): "
         "'missing.whl'"
+    )
+
+
+def test_credential_source_unavailable_handling(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["twine", "upload", "test.whl"])
+    monkeypatch.setattr(
+        upload,
+        "upload",
+        pretend.raiser(
+            exceptions.CredentialSourceUnavailable(
+                source="trusted-publishing",
+                stage="oidc-token",
+                detail="no ambient OIDC credential was detected",
+            )
+        ),
+    )
+
+    error = dunder_main.main()
+    assert error
+
+    captured = capsys.readouterr()
+
+    expected = (
+        "CredentialSourceUnavailable: Required credential source "
+        "'trusted-publishing' is unavailable at stage 'oidc-token': no ambient "
+        "OIDC credential was detected"
+    )
+    # Rich color state depends on test ordering, so accept both renderings.
+    assert _unwrap_lines(captured.out) in (
+        f"{RED_ERROR} {expected}",
+        f"{PLAIN_ERROR} {expected}",
     )
 
 

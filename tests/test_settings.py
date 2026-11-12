@@ -198,3 +198,37 @@ class TestArgumentParsing:
     def test_attestations_flag(self):
         args = self.parse_args(["--attestations"])
         assert args.attestations
+
+    def test_credential_source_flag(self):
+        args = self.parse_args(["--credential-source", "trusted-publishing"])
+        assert args.credential_source == "trusted-publishing"
+
+    def test_credential_source_environment(self, monkeypatch):
+        monkeypatch.setenv("TWINE_CREDENTIAL_SOURCE", "trusted-publishing")
+        args = self.parse_args([])
+        assert args.credential_source == "trusted-publishing"
+
+    def test_credential_source_defaults_to_none(self):
+        args = self.parse_args([])
+        assert args.credential_source is None
+
+    def test_credential_source_rejects_unknown_value(self):
+        with pytest.raises(SystemExit):
+            self.parse_args(["--credential-source", "keyring"])
+
+
+def test_credential_source_is_passed_to_resolver():
+    s = settings.Settings(credential_source="trusted-publishing")
+    assert s.auth.credential_source == "trusted-publishing"
+    assert s.auth.requires_trusted_publishing
+
+
+def test_credential_source_defaults_to_unrestricted():
+    s = settings.Settings()
+    assert s.auth.credential_source is None
+    assert not s.auth.requires_trusted_publishing
+
+
+def test_unknown_credential_source_raises_invalid_configuration():
+    with pytest.raises(exceptions.InvalidConfiguration):
+        settings.Settings(credential_source="keyring")

@@ -151,6 +151,41 @@ on a CI/build server).
   self-signed or untrusted certificates.
 * ``TWINE_NON_INTERACTIVE`` - Do not interactively prompt for username/password
   if the required credentials are missing.
+* ``TWINE_CREDENTIAL_SOURCE`` - Restrict credentials to the named source.
+  Equivalent to ``--credential-source``; see :ref:`restricting-credential-sources`.
+
+Restricting Credential Sources
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default Twine resolves credentials in this order: an explicit ``--username``/
+``--password`` (or ``TWINE_USERNAME``/``TWINE_PASSWORD``), the ``.pypirc``
+configuration, the system keyring, trusted publishing, and finally an
+interactive prompt. Development machines can keep using that flow unchanged.
+
+For unattended release pipelines that must only use the short-lived token
+obtained through `trusted publishing`_, pass
+``--credential-source trusted-publishing`` (or set
+``TWINE_CREDENTIAL_SOURCE=trusted-publishing``). When the restriction is
+enabled, Twine:
+
+* authenticates as ``__token__`` without querying the keyring or prompting;
+* never falls back to a keyring, ``.pypirc``, or environment password, and
+  fails instead if one is supplied;
+* stops the run if the trusted publishing exchange cannot complete, reporting
+  the stage at which it failed:
+
+  1. ``oidc-audience`` - fetching the audience from
+     ``https://<index>/_/oidc/audience``;
+  2. ``oidc-token`` - obtaining an ambient OIDC token from the CI platform;
+  3. ``token-exchange`` - minting an upload token at
+     ``https://<index>/_/oidc/mint-token``;
+  4. ``token-response`` - decoding the mint-token response.
+
+The failure is raised as a ``CredentialSourceUnavailable`` error whose
+``stage`` attribute names the stage above, so CI logs show where the pipeline
+stopped. The restriction is only supported for PyPI and TestPyPI.
+
+.. _`trusted publishing`: https://docs.pypi.org/trusted-publishers/
 
 Proxy Support
 ^^^^^^^^^^^^^

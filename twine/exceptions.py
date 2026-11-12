@@ -157,6 +157,27 @@ class TrustedPublishingFailure(TwineException):
     pass
 
 
+class CredentialSourceUnavailable(TwineException):
+    """Raised when an explicitly required credential source cannot be used.
+
+    This is used by unattended jobs that restrict credential resolution to a
+    single source (e.g. trusted publishing). It reports the stage at which the
+    required source became unavailable so the job stops instead of silently
+    falling back to another source such as a keyring password.
+    """
+
+    def __init__(self, source: str, stage: str, detail: t.Optional[str] = None):
+        self.source = source
+        self.stage = stage
+        message = (
+            f"Required credential source {source!r} is unavailable "
+            f"at stage {stage!r}"
+        )
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
 class InvalidPyPIUploadURL(TwineException):
     """Repository configuration tries to use PyPI with an incorrect URL.
 
