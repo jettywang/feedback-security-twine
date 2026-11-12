@@ -1,0 +1,4 @@
+Add a ``--sha256-manifest`` option to ``twine upload`` that accepts a
+``sha256sum``-style manifest of expected digests. Every distribution is
+verified against the manifest before anything is uploaded; a mismatch or
+missing entry aborts the upload with nothing sent.

@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
+import pathlib
+import shutil
 
 import pretend
 import pytest
@@ -586,3 +589,133 @@ def test_upload_warns_attestations_non_pypi(upload_settings, caplog, stub_respon
         "failures, remove the --attestations flag and re-try this command"
         in caplog.messages
     )
+
+
+@pytest.fixture
+def recording_repository(stub_response):
+    """Fake upload endpoint that records the bytes it receives."""
+    received = {}
+
+    def record_upload(package):
+        received[package.basefilename] = pathlib.Path(package.filename).read_bytes()
+        return stub_response
+
+    return pretend.stub(
+        upload=record_upload,
+        close=lambda: None,
+        release_urls=lambda packages: set(),
+        received=received,
+    )
+
+
+def _copy_dists_to_tmp_path(tmp_path, fixtures):
+    """Copy distribution fixtures into a temporary directory."""
+    dists = []
+    for fixture in fixtures:
+        dest = tmp_path / os.path.basename(fixture)
+        shutil.copy(fixture, dest)
+        dists.append(dest)
+    return dists
+
+
+def _write_manifest(tmp_path, entries):
+    """Write a sha256sum-style manifest of ``(filename, hexdigest)`` entries."""
+    manifest = tmp_path / "SHA256SUMS"
+    manifest.write_text(
+        "".join(f"{digest}  {filename}\n" for filename, digest in entries)
+    )
+    return str(manifest)
+
+
+def _sha256(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def test_upload_sha256_manifest_success(
+    tmp_path, make_settings, recording_repository, caplog
+):
+    """Upload multiple files whose digests all match the manifest."""
+    dists = _copy_dists_to_tmp_path(
+        tmp_path, [helpers.WHEEL_FIXTURE, helpers.NEW_SDIST_FIXTURE]
+    )
+    manifest = _write_manifest(tmp_path, [(dist.name, _sha256(dist)) for dist in dists])
+
+    upload_settings = make_settings(sha256_manifest=manifest)
+    upload_settings.verbose = True
+    upload_settings.create_repository = lambda: recording_repository
+
+    upload.upload(upload_settings, [str(dist) for dist in dists])
+
+    assert recording_repository.received == {
+        dist.name: dist.read_bytes() for dist in dists
+    }
+    assert f"Verified SHA-256 digest of {dists[0].name}" in caplog.messages
+    assert f"Verified SHA-256 digest of {dists[1].name}" in caplog.messages
+
+
+def test_upload_sha256_manifest_mismatch(tmp_path, make_settings, recording_repository):
+    """Abort without any upload when a digest does not match the manifest."""
+    dists = _copy_dists_to_tmp_path(
+        tmp_path, [helpers.WHEEL_FIXTURE, helpers.NEW_SDIST_FIXTURE]
+    )
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            (dists[0].name, _sha256(dists[0])),
+            (dists[1].name, "0" * 64),
+        ],
+    )
+
+    upload_settings = make_settings(sha256_manifest=manifest)
+    upload_settings.create_repository = lambda: recording_repository
+
+    with pytest.raises(
+        exceptions.InvalidManifest, match="SHA-256 digest of .* does not match"
+    ):
+        upload.upload(upload_settings, [str(dist) for dist in dists])
+
+    assert recording_repository.received == {}
+
+
+def test_upload_sha256_manifest_missing_entry(
+    tmp_path, make_settings, recording_repository
+):
+    """Abort without any upload when a file is missing from the manifest."""
+    dists = _copy_dists_to_tmp_path(
+        tmp_path, [helpers.WHEEL_FIXTURE, helpers.NEW_SDIST_FIXTURE]
+    )
+    manifest = _write_manifest(tmp_path, [(dists[0].name, _sha256(dists[0]))])
+
+    upload_settings = make_settings(sha256_manifest=manifest)
+    upload_settings.create_repository = lambda: recording_repository
+
+    with pytest.raises(
+        exceptions.InvalidManifest, match="missing from the SHA-256 manifest"
+    ):
+        upload.upload(upload_settings, [str(dist) for dist in dists])
+
+    assert recording_repository.received == {}
+
+
+def test_load_sha256_manifest_malformed_line(tmp_path):
+    """Reject a manifest line that is not '<digest>  <filename>'."""
+    manifest = tmp_path / "SHA256SUMS"
+    manifest.write_text("not-a-digest\n")
+
+    with pytest.raises(exceptions.InvalidManifest, match="Malformed line 1"):
+        upload._load_sha256_manifest(str(manifest))
+
+
+def test_load_sha256_manifest_parses_sha256sum_format(tmp_path):
+    """Parse comments, binary-mode markers, and directory components."""
+    digest = "a" * 64
+    manifest = tmp_path / "SHA256SUMS"
+    manifest.write_text(
+        f"# comment\n\n{digest} *dist/twine-4.0.2-py3-none-any.whl\n"
+        f"{digest.upper()}  twine-1.5.0.tar.gz\n"
+    )
+
+    assert upload._load_sha256_manifest(str(manifest)) == {
+        "twine-4.0.2-py3-none-any.whl": digest,
+        "twine-1.5.0.tar.gz": digest,
+    }

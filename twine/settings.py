@@ -61,6 +61,7 @@ class Settings:
         repository_url: Optional[str] = None,
         verbose: bool = False,
         disable_progress_bar: bool = False,
+        sha256_manifest: Optional[str] = None,
         **ignored_kwargs: Any,
     ) -> None:
         """Initialize our settings instance.
@@ -107,12 +108,17 @@ class Settings:
             Show verbose output.
         :param disable_progress_bar:
             Disable the progress bar.
+        :param sha256_manifest:
+            The path to a ``sha256sum``-style manifest of expected SHA-256
+            digests. When provided, every distribution is verified against
+            the manifest before anything is uploaded.
         """
         self.config_file = config_file
         self.comment = comment
         self.verbose = verbose
         self.disable_progress_bar = disable_progress_bar
         self.skip_existing = skip_existing
+        self.sha256_manifest = sha256_manifest
         self._handle_repository_options(
             repository_name=repository_name,
             repository_url=repository_url,
@@ -277,6 +283,14 @@ class Settings:
             required=False,
             action="store_true",
             help="Disable the progress bar.",
+        )
+        parser.add_argument(
+            "--sha256-manifest",
+            metavar="path",
+            help="Path to a sha256sum-style manifest of expected SHA-256 "
+            "digests for the distribution files. Every file is verified "
+            "against the manifest before anything is uploaded; if any "
+            "digest mismatches or is missing, the upload is aborted.",
         )
 
     @classmethod

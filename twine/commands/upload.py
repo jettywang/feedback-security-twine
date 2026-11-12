@@ -15,6 +15,7 @@
 # limitations under the License.
 import argparse
 import logging
+import os
 from typing import Dict, List, cast
 
 import requests
@@ -102,6 +103,73 @@ def _make_package(
     return package
 
 
+def _load_sha256_manifest(manifest_path: str) -> Dict[str, str]:
+    """Parse a ``sha256sum``-style manifest into ``{basename: hexdigest}``.
+
+    Each non-empty, non-comment line must look like::
+
+        <64 hex chars>  <filename>
+
+    where the filename may be prefixed with ``*`` (binary mode marker) and
+    may include directory components, which are ignored.
+
+    :raises twine.exceptions.InvalidManifest:
+        A line in the manifest is malformed.
+    """
+    expected: Dict[str, str] = {}
+    with open(manifest_path, encoding="utf-8") as fp:
+        for line_number, raw_line in enumerate(fp, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            digest, separator, filename = line.partition(" ")
+            filename = filename.strip().lstrip("*")
+            if (
+                not separator
+                or not filename
+                or len(digest) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in digest)
+            ):
+                raise exceptions.InvalidManifest(
+                    f"Malformed line {line_number} in SHA-256 manifest "
+                    f"{manifest_path}: {raw_line.rstrip()!r}"
+                )
+
+            expected[os.path.basename(filename)] = digest.lower()
+
+    return expected
+
+
+def _verify_sha256_manifest(
+    packages: List[package_file.PackageFile], manifest_path: str
+) -> None:
+    """Verify every package against the expected digests in the manifest.
+
+    :raises twine.exceptions.InvalidManifest:
+        A package is missing from the manifest or its digest does not match.
+    """
+    expected = _load_sha256_manifest(manifest_path)
+
+    for package in packages:
+        expected_digest = expected.get(package.basefilename)
+        if expected_digest is None:
+            raise exceptions.InvalidManifest(
+                f"{package.basefilename} is missing from the SHA-256 "
+                f"manifest {manifest_path}"
+            )
+
+        actual_digest = package.sha2_digest
+        if actual_digest is None or actual_digest.lower() != expected_digest:
+            raise exceptions.InvalidManifest(
+                f"SHA-256 digest of {package.basefilename} does not match "
+                f"the manifest: expected {expected_digest}, "
+                f"got {actual_digest}"
+            )
+
+        logger.info(f"Verified SHA-256 digest of {package.basefilename}")
+
+
 def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
     """Upload one or more distributions to a repository, and display the progress.
 
@@ -152,6 +220,11 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
         )
         for filename in uploads
     ]
+
+    # Verify all packages against the expected digests before touching the
+    # network, so a mismatch or missing entry aborts with nothing uploaded.
+    if upload_settings.sha256_manifest:
+        _verify_sha256_manifest(packages_to_upload, upload_settings.sha256_manifest)
 
     if any(p.gpg_signature for p in packages_to_upload):
         if repository_url.startswith((utils.DEFAULT_REPOSITORY, utils.TEST_REPOSITORY)):

@@ -145,6 +145,12 @@ class InvalidDistribution(TwineException):
     pass
 
 
+class InvalidManifest(TwineException):
+    """Raised when a SHA-256 manifest is malformed or fails verification."""
+
+    pass
+
+
 class NonInteractive(TwineException):
     """Raised in non-interactive mode when credentials could not be found."""
 
