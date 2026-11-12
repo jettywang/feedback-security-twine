@@ -28,6 +28,17 @@ from twine import utils
 
 logger = logging.getLogger(__name__)
 
+#: Pipeline stage at which distributions are posted to the index. Used in
+#: failure messages so errors can be located.
+UPLOAD_STAGE = "upload"
+
+
+def _failure_context(upload_settings: settings.Settings) -> str:
+    return utils.failure_context(
+        upload_settings.repository_name,
+        UPLOAD_STAGE,
+    )
+
 
 def skip_upload(
     response: requests.Response, skip_existing: bool, package: package_file.PackageFile
@@ -194,7 +205,16 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
             logger.warning(skip_message)
             continue
 
-        resp = repository.upload(package)
+        try:
+            resp = repository.upload(package)
+        except requests.ConnectionError as exc:
+            # A broken connection never reaches status handling, so annotate
+            # it here with the same locator fragment as other failures. The
+            # exception message only describes the connection problem; it does
+            # not include request headers or credentials.
+            raise requests.ConnectionError(
+                f"{_failure_context(upload_settings)} {exc}"
+            ) from exc
         logger.info(f"Response from {resp.url}:\n{resp.status_code} {resp.reason}")
         if resp.text:
             logger.info(resp.text)
@@ -213,7 +233,17 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
             logger.warning(skip_message)
             continue
 
-        utils.check_status_code(resp, upload_settings.verbose)
+        try:
+            utils.check_status_code(resp, upload_settings.verbose)
+        except requests.HTTPError as exc:
+            # Attach the repository alias and pipeline stage so the failure is
+            # locatable while keeping the response object (and thus the status
+            # code and URL) available on the exception.
+            raise requests.HTTPError(
+                f"{_failure_context(upload_settings)} {exc}",
+                response=exc.response,
+                request=exc.request,
+            ) from exc
 
         uploaded_packages.append(package)
 

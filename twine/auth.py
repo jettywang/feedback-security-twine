@@ -31,6 +31,9 @@ from twine import utils
 logger = logging.getLogger(__name__)
 
 TOKEN_USERNAME: t.Final[str] = "__token__"
+#: Pipeline stage at which trusted publishing exchanges an OIDC token for an
+#: upload token. Used in failure messages so errors can be located.
+TRUSTED_PUBLISHING_STAGE: t.Final[str] = "trusted-publishing"
 #: Tokens expire after 15 minutes, let's start allowing renewal/replacement
 #: after 10 minutes that way if we fail, we may still have time to replace it
 #: before it expires. Thus, if our current time + this threshold is past the
@@ -96,9 +99,18 @@ class Resolver:
         self,
         config: utils.RepositoryConfig,
         input: CredentialInput,
+        repository_name: str = "pypi",
     ) -> None:
         self.config = config
         self.input = input
+        # The configured repository alias, used only for log/error messages.
+        self.repository_name = repository_name
+
+    def _failure(self, message: str) -> "exceptions.TrustedPublishingFailure":
+        return exceptions.TrustedPublishingFailure(
+            f"{utils.failure_context(self.repository_name, TRUSTED_PUBLISHING_STAGE)}"
+            f" {message}"
+        )
 
     @property
     @functools.lru_cache()
@@ -175,7 +187,7 @@ class Resolver:
         except AmbientCredentialError as e:
             # If we get here, we're on a supported CI platform for trusted
             # publishing, and we have not been given any token, so we can error.
-            raise exceptions.TrustedPublishingFailure(
+            raise self._failure(
                 "Unable to retrieve an OIDC token from the CI platform for "
                 f"trusted publishing {e}"
             )
@@ -202,7 +214,7 @@ class Resolver:
         try:
             mint_token_payload = mint_token_resp.json()
         except json.JSONDecodeError:
-            raise exceptions.TrustedPublishingFailure(
+            raise self._failure(
                 "The token-minting request returned invalid JSON"
             )
 
@@ -211,7 +223,7 @@ class Resolver:
                 f"* `{error['code']}`: {error['description']}"
                 for error in mint_token_payload["errors"]
             )
-            raise exceptions.TrustedPublishingFailure(
+            raise self._failure(
                 "The token request failed; the index server gave the following"
                 f" reasons:\n\n{reasons}"
             )

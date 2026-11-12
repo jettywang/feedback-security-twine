@@ -117,6 +117,9 @@ class Settings:
             repository_name=repository_name,
             repository_url=repository_url,
         )
+        # Keep the configured repository alias for log/error messages; the
+        # alias itself is not sensitive, unlike the credentials.
+        self.repository_name = repository_name
         self.attestations = attestations
         self._handle_package_signing(
             sign=sign,
@@ -128,6 +131,7 @@ class Settings:
         self.auth = auth.Resolver.choose(not non_interactive)(
             self.repository_config,
             auth.CredentialInput(username, password),
+            repository_name=repository_name,
         )
 
     @property

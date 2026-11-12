@@ -143,6 +143,17 @@ def get_config(path: str) -> Dict[str, RepositoryConfig]:
     return dict(config)
 
 
+def failure_context(repository_name: str, stage: str) -> str:
+    """Build the locator fragment attached to every failure message.
+
+    The fragment identifies the configured repository (its ``.pypirc``
+    alias, not its URL) and the pipeline stage that failed, so errors can be
+    triaged without ever referencing credentials. It intentionally carries
+    no request or credential data.
+    """
+    return f"[repository={repository_name} stage={stage}]"
+
+
 def sanitize_url(url: str) -> str:
     """Sanitize a URL.
 

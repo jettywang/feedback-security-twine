@@ -51,11 +51,25 @@ def main() -> Any:
             # See: <https://github.com/pypi/warehouse/issues/19713>
             status_phrase = "Unknown Status"
 
+        # Preserve the repository alias / stage fragment that the raising
+        # pipeline stage attached to the exception message, if present.
+        context_fragment = next(
+            (part for part in str(exc).split() if part.startswith("[repository=")),
+            "",
+        )
+        prefix = f"{context_fragment} " if context_fragment else ""
+
         logger.error(
-            f"{exc.__class__.__name__}: {status_code} {status_phrase} "
+            f"{prefix}{exc.__class__.__name__}: {status_code} {status_phrase} "
             f"from {response.url}\n"
             f"{response.reason}"
         )
+    except requests.RequestException as exc:
+        # Connection failures and other transport-level problems. These do
+        # not carry a response, so log the already-annotated exception message
+        # rather than dumping a traceback (which could echo request details).
+        error = True
+        logger.error(f"{exc.__class__.__name__}: {exc.args[0]}")
     except exceptions.TwineException as exc:
         error = True
         logger.error(f"{exc.__class__.__name__}: {exc.args[0]}")
