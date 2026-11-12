@@ -20,6 +20,7 @@ import requests
 from twine import cli
 from twine import exceptions
 from twine import package as package_file
+from twine import repository as repository_module
 from twine.commands import upload
 
 from . import helpers
@@ -48,6 +49,7 @@ def stub_repository(stub_response):
         upload=pretend.call_recorder(lambda package: stub_response),
         close=lambda: None,
         release_urls=lambda packages: set(),
+        verify_feature_capability=lambda required_features: None,
     )
 
 
@@ -384,7 +386,9 @@ def test_exception_for_redirect(
     )
 
     stub_repository = pretend.stub(
-        upload=lambda package: stub_response, close=lambda: None
+        upload=lambda package: stub_response,
+        close=lambda: None,
+        verify_feature_capability=lambda required_features: None,
     )
 
     upload_settings.create_repository = lambda: stub_repository
@@ -567,6 +571,68 @@ def test_check_status_code_for_wrong_repo_url(repo_url, upload_settings, stub_re
                 helpers.NEW_WHEEL_FIXTURE,
             ],
         )
+
+
+def test_capabilities_negotiated_once_for_all_files(
+    make_settings, stub_response, caplog
+):
+    """Negotiate repository capabilities once when uploading several files."""
+    upload_settings = make_settings()
+    upload_settings.skip_existing = True
+    upload_settings.disable_progress_bar = True
+
+    get = pretend.call_recorder(
+        lambda url, headers: pretend.stub(
+            raise_for_status=lambda: None,
+            json=lambda: {"capabilities": ["skip-existing"]},
+        )
+    )
+    post = pretend.call_recorder(lambda *args, **kwargs: stub_response)
+    stub_response.text = ""
+    fake_repository = upload_settings.create_repository()
+    fake_repository.disable_progress_bar = True
+    fake_repository.session = pretend.stub(get=get, post=post, close=lambda: None)
+    fake_repository.package_is_uploaded = lambda package: False
+    fake_repository.release_urls = lambda packages: set()
+    upload_settings.create_repository = lambda: fake_repository
+
+    result = upload.upload(
+        upload_settings, [helpers.WHEEL_FIXTURE, helpers.SDIST_FIXTURE]
+    )
+    assert result is None
+
+    assert len(get.calls) == 1
+    assert get.calls[0].args[0].endswith(repository_module.CAPABILITIES_ENDPOINT)
+    assert len(post.calls) == 2
+
+
+def test_unsupported_feature_aborts_before_first_file(make_settings):
+    """Abort before any file is transferred when a feature is unsupported."""
+    upload_settings = make_settings()
+    upload_settings.skip_existing = True
+    upload_settings.disable_progress_bar = True
+
+    get = pretend.call_recorder(
+        lambda url, headers: pretend.stub(
+            raise_for_status=lambda: None,
+            json=lambda: {"capabilities": []},
+        )
+    )
+    post = pretend.call_recorder(lambda *args, **kwargs: pretend.stub())
+    fake_repository = upload_settings.create_repository()
+    fake_repository.disable_progress_bar = True
+    fake_repository.session = pretend.stub(get=get, post=post)
+    fake_repository.package_is_uploaded = lambda package: False
+    fake_repository.release_urls = lambda packages: set()
+    upload_settings.create_repository = lambda: fake_repository
+
+    with pytest.raises(exceptions.UnsupportedConfiguration):
+        upload.upload(
+            upload_settings, [helpers.WHEEL_FIXTURE, helpers.SDIST_FIXTURE]
+        )
+
+    assert len(get.calls) == 1
+    assert post.calls == []
 
 
 def test_upload_warns_attestations_non_pypi(upload_settings, caplog, stub_response):

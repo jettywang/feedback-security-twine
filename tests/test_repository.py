@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 from contextlib import contextmanager
 
@@ -20,6 +21,7 @@ import pytest
 import requests
 from packaging import version
 
+from twine import exceptions
 from twine import package
 from twine import repository
 from twine import utils
@@ -351,3 +353,100 @@ def test_logs_username_and_password(username, password, messages, caplog):
     )
 
     assert caplog.messages == messages
+
+
+def capability_response(capabilities, status_code=200):
+    return response_with(
+        status_code=status_code,
+        _content=json.dumps({"capabilities": capabilities}).encode(),
+        _content_consumed=True,
+    )
+
+
+def test_read_capabilities_is_negotiated_once(default_repo):
+    """Reuse one successful capability read across all files in an upload."""
+    get = pretend.call_recorder(
+        lambda url, headers: capability_response(["skip-existing"])
+    )
+    default_repo.session = pretend.stub(get=get)
+
+    expected_url = (
+        utils.DEFAULT_REPOSITORY.rstrip("/")
+        + "/"
+        + repository.CAPABILITIES_ENDPOINT
+    )
+
+    # Two files in the same upload only trigger one negotiation.
+    assert default_repo.read_capabilities() == {"skip-existing"}
+    assert default_repo.read_capabilities() == {"skip-existing"}
+
+    assert len(get.calls) == 1
+    assert get.calls[0].args == (expected_url,)
+
+
+def test_read_capabilities_is_reread_after_repository_change(default_repo):
+    """Negotiate again when the target repository changes."""
+    get = pretend.call_recorder(
+        lambda url, headers: capability_response(["skip-existing"])
+    )
+    default_repo.session = pretend.stub(get=get)
+
+    default_repo.read_capabilities()
+    default_repo.url = "https://other.example.com/legacy/"
+    default_repo.read_capabilities()
+
+    assert len(get.calls) == 2
+    requested_urls = [call.args[0] for call in get.calls]
+    assert requested_urls == [
+        utils.DEFAULT_REPOSITORY.rstrip("/")
+        + "/"
+        + repository.CAPABILITIES_ENDPOINT,
+        "https://other.example.com/legacy/" + repository.CAPABILITIES_ENDPOINT,
+    ]
+
+
+def test_read_capabilities_is_reread_after_failure(default_repo):
+    """Do not cache a failed read; the next attempt renegotiates."""
+    responses = iter(
+        [
+            response_with(status_code=500),
+            capability_response(["skip-existing"]),
+        ]
+    )
+    get = pretend.call_recorder(lambda url, headers: next(responses))
+    default_repo.session = pretend.stub(get=get)
+
+    with pytest.raises(requests.HTTPError):
+        default_repo.read_capabilities()
+
+    assert default_repo.read_capabilities() == {"skip-existing"}
+    assert len(get.calls) == 2
+
+
+def test_verify_feature_capability_passes_when_supported(default_repo):
+    """Accept a configuration whose features are all advertised."""
+    default_repo.session = pretend.stub(
+        get=pretend.call_recorder(
+            lambda url, headers: capability_response(["skip-existing"])
+        )
+    )
+
+    default_repo.verify_feature_capability({"skip-existing": "--skip-existing"})
+
+
+def test_verify_feature_capability_raises_before_upload(default_repo):
+    """Raise on an unsupported feature without uploading anything."""
+    post = pretend.call_recorder(lambda *args, **kwargs: response_with())
+    default_repo.session = pretend.stub(
+        get=pretend.call_recorder(
+            lambda url, headers: capability_response(["other-feature"])
+        ),
+        post=post,
+    )
+
+    with pytest.raises(exceptions.UnsupportedConfiguration):
+        default_repo.verify_feature_capability(
+            {"skip-existing": "--skip-existing"}
+        )
+
+    assert post.calls == []

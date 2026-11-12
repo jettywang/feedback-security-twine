@@ -19,7 +19,6 @@ import logging
 import pytest
 
 from twine import exceptions
-from twine import repository
 from twine import settings
 
 
@@ -77,38 +76,12 @@ def test_settings_transforms_repository_config_non_pypi(write_config_file):
     assert s.disable_progress_bar is False
 
 
-def test_settings_verify_feature_compatibility() -> None:
+def test_settings_required_features() -> None:
     s = settings.Settings(skip_existing=True)
-    s.repository_config = {"repository": repository.WAREHOUSE}
-    try:
-        s.verify_feature_capability()
-    except exceptions.UnsupportedConfiguration as unexpected_exc:
-        pytest.fail(
-            "Expected feature capability to work with production PyPI"
-            f" but got {unexpected_exc!r}"
-        )
-
-    s.repository_config["repository"] = repository.TEST_WAREHOUSE
-    try:
-        s.verify_feature_capability()
-    except exceptions.UnsupportedConfiguration as unexpected_exc:
-        pytest.fail(
-            "Expected feature capability to work with TestPyPI but got"
-            f" {unexpected_exc!r}"
-        )
-
-    s.repository_config["repository"] = "https://not-really-pypi.example.com/legacy"
-    with pytest.raises(exceptions.UnsupportedConfiguration):
-        s.verify_feature_capability()
+    assert s.required_features == {"skip-existing": "--skip-existing"}
 
     s.skip_existing = False
-    try:
-        s.verify_feature_capability()
-    except exceptions.UnsupportedConfiguration as unexpected_exc:
-        pytest.fail(
-            "Expected an exception only when --skip-existing is provided"
-            f" but got {unexpected_exc!r}"
-        )
+    assert s.required_features == {}
 
 
 @pytest.mark.parametrize(

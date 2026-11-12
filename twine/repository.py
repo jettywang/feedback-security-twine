@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import requests
 import requests_toolbelt
 import rich.progress
 from rich import print
 
+from twine import exceptions
 from twine import package as package_file
 from twine.utils import make_requests_session
 
@@ -28,6 +29,10 @@ WAREHOUSE = "https://upload.pypi.org/"
 OLD_WAREHOUSE = "https://upload.pypi.io/"
 TEST_WAREHOUSE = "https://test.pypi.org/"
 WAREHOUSE_WEB = "https://pypi.org/"
+
+# Endpoint, relative to the repository URL, advertising the features the
+# repository supports. A successful read is shared by every file in an upload.
+CAPABILITIES_ENDPOINT = "capabilities/"
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,74 @@ class Repository:
         # Working around https://github.com/python/typing/issues/182
         self._releases_json_data: Dict[str, Dict[str, Any]] = {}
         self.disable_progress_bar = disable_progress_bar
+
+        # Capabilities read from the repository. Only a successful read is
+        # cached; failures leave these empty so the next read is retried.
+        self._capabilities: Optional[Set[str]] = None
+        self._capabilities_url: Optional[str] = None
+
+    @property
+    def _capability_endpoint(self) -> str:
+        return self.url.rstrip("/") + "/" + CAPABILITIES_ENDPOINT
+
+    def read_capabilities(self) -> Set[str]:
+        """Read the features supported by the repository.
+
+        The result of a successful read is cached and reused for every file
+        uploaded in the same command invocation. The cache is discarded when
+        the target repository changes or when a previous read failed, so each
+        of those situations triggers a fresh negotiation.
+
+        :raises requests.RequestException:
+            The repository could not be reached or returned an error response.
+        """
+        capabilities_url = self._capability_endpoint
+        if (
+            self._capabilities is not None
+            and self._capabilities_url == capabilities_url
+        ):
+            return self._capabilities
+
+        response = self.session.get(
+            capabilities_url,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+
+        capabilities = set(response.json().get("capabilities", ()))
+        self._capabilities = capabilities
+        self._capabilities_url = capabilities_url
+        return capabilities
+
+    def verify_feature_capability(
+        self, required_features: Mapping[str, str]
+    ) -> None:
+        """Verify the repository supports every requested feature.
+
+        The capability read happens once and is shared by all files in the
+        upload. Unsupported features raise before any file is transferred.
+
+        :param required_features:
+            Mapping of repository capability identifiers to the user-facing
+            feature names reported when the capability is missing.
+        :raises twine.exceptions.UnsupportedConfiguration:
+            One or more required capabilities are not advertised by the
+            repository.
+        :raises requests.RequestException:
+            The repository capabilities could not be read.
+        """
+        supported = self.read_capabilities()
+        unsupported = [
+            feature_name
+            for capability, feature_name in required_features.items()
+            if capability not in supported
+        ]
+        if unsupported:
+            builder = exceptions.UnsupportedConfiguration.Builder()
+            builder.with_repository_url(self.url)
+            for feature_name in unsupported:
+                builder.with_feature(feature_name)
+            raise builder.finalize()
 
     def close(self) -> None:
         self.session.close()

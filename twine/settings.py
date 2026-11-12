@@ -16,7 +16,7 @@
 import argparse
 import contextlib
 import logging
-from typing import Any, Optional, cast
+from typing import Any, Dict, Optional, cast
 
 from twine import auth
 from twine import exceptions
@@ -313,24 +313,20 @@ class Settings:
         self.cacert = utils.get_cacert(cacert, self.repository_config)
         self.client_cert = utils.get_clientcert(client_cert, self.repository_config)
 
-    def verify_feature_capability(self) -> None:
-        """Verify configured settings are supported for the configured repository.
+    @property
+    def required_features(self) -> Dict[str, str]:
+        """Features requested through settings that the repository must support.
 
-        This presently checks:
-        - ``--skip-existing`` was only provided for PyPI and TestPyPI
+        Keys are the capability identifiers advertised by the repository;
+        values are the user-facing names shown when a capability is missing.
 
-        :raises twine.exceptions.UnsupportedConfiguration:
-            The configured features are not available with the configured
-            repository.
+        This presently covers:
+        - ``--skip-existing``
         """
-        repository_url = cast(str, self.repository_config["repository"])
-
-        if self.skip_existing and not repository_url.startswith(
-            (repository.WAREHOUSE, repository.TEST_WAREHOUSE)
-        ):
-            raise exceptions.UnsupportedConfiguration.Builder().with_feature(
-                "--skip-existing"
-            ).with_repository_url(repository_url).finalize()
+        required_features: Dict[str, str] = {}
+        if self.skip_existing:
+            required_features["skip-existing"] = "--skip-existing"
+        return required_features
 
     def check_repository_url(self) -> None:
         """Verify we are not using legacy PyPI.

@@ -125,7 +125,6 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
         The repository responded with an error.
     """
     upload_settings.check_repository_url()
-    upload_settings.verify_feature_capability()
     repository_url = cast(str, upload_settings.repository_config["repository"])
 
     # Attestations are only supported on PyPI and TestPyPI at the moment.
@@ -174,6 +173,9 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
             )
 
     repository = upload_settings.create_repository()
+    # Negotiate the repository's capabilities once for the whole upload. An
+    # unsupported feature aborts before the first file is transferred.
+    repository.verify_feature_capability(upload_settings.required_features)
     uploaded_packages = []
 
     if signatures and not packages_to_upload:
