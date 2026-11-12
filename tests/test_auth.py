@@ -1,9 +1,7 @@
 import base64
 import getpass
 import logging
-import platform
 import re
-import time
 import typing as t
 
 import pytest
@@ -19,95 +17,266 @@ def config() -> utils.RepositoryConfig:
     return dict(repository="system")
 
 
-def test_get_username_keyring_defers_to_prompt(monkeypatch, entered_username, config):
-    class MockKeyring:
-        @staticmethod
-        def get_credential(system, user):
-            return None
+@pytest.fixture
+def entered_username(monkeypatch):
+    monkeypatch.setattr(auth, "input", lambda prompt: "entered user", raising=False)
 
-    monkeypatch.setattr(auth, "keyring", MockKeyring)
 
-    username = auth.Resolver(config, auth.CredentialInput()).username
+@pytest.fixture
+def entered_password(monkeypatch):
+    monkeypatch.setattr(getpass, "getpass", lambda prompt: "entered pw")
+
+
+class RecordingKeyring:
+    """Recording double for the subset of the keyring API twine uses.
+
+    Nothing here touches the host's real keyring service; every call is
+    recorded so tests can assert how often credential sources are consulted.
+    """
+
+    def __init__(
+        self,
+        credential: t.Optional[auth.CredentialInput] = None,
+        password: t.Optional[str] = None,
+        get_credential_error: t.Optional[t.Callable[[], Exception]] = None,
+        get_password_error: t.Optional[t.Callable[[], Exception]] = None,
+    ) -> None:
+        self._credential = credential
+        self._password = password
+        self._get_credential_error = get_credential_error
+        self._get_password_error = get_password_error
+        self.get_credential_calls: list[tuple[t.Any, t.Any]] = []
+        self.get_password_calls: list[tuple[t.Any, t.Any]] = []
+
+    def get_credential(
+        self, system: str, username: t.Optional[str]
+    ) -> t.Optional[auth.CredentialInput]:
+        self.get_credential_calls.append((system, username))
+        if self._get_credential_error is not None:
+            raise self._get_credential_error()
+        return self._credential
+
+    def get_password(
+        self, system: str, username: str
+    ) -> t.Optional[str]:
+        self.get_password_calls.append((system, username))
+        if self._get_password_error is not None:
+            raise self._get_password_error()
+        return self._password
+
+
+class LegacyKeyring:
+    """Double for keyring prior to 15.2, which lacks ``get_credential``."""
+
+    def __init__(self) -> None:
+        self.get_password_calls: list[tuple[t.Any, t.Any]] = []
+
+    def get_password(
+        self, system: str, username: str
+    ) -> t.Optional[str]:
+        self.get_password_calls.append((system, username))
+        return None
+
+
+class MockResponse:
+    def __init__(
+        self,
+        status_code: int,
+        json: t.Any,
+        error_payload: t.Optional[t.Any] = None,
+    ) -> None:
+        self.status_code = status_code
+        self._json = json
+        self._error_payload = error_payload
+
+    def json(self, *args, **kwargs) -> t.Any:
+        if self._error_payload is not None and not self.ok:
+            return self._error_payload
+        return self._json
+
+    def raise_for_status(self) -> None:
+        if 400 <= self.status_code:
+            raise requests.exceptions.HTTPError()
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+
+class RecordingSession:
+    """Requests session double that records every upstream interaction."""
+
+    def __init__(
+        self,
+        get_response: MockResponse,
+        post_responses: t.Optional[t.List[MockResponse]] = None,
+    ) -> None:
+        self.get_calls: list[tuple[t.Any, t.Any]] = []
+        self.post_calls: list[t.Dict[str, t.Any]] = []
+        self._get_response = get_response
+        self._post_responses = post_responses or []
+
+    def get(self, url: str, **kwargs) -> MockResponse:
+        self.get_calls.append((url, kwargs))
+        return self._get_response
+
+    def post(self, url: str, **kwargs) -> MockResponse:
+        self.post_calls.append({"url": url, **kwargs})
+        if not self._post_responses:
+            raise AssertionError("unexpected token mint request")
+        return self._post_responses.pop(0)
+
+
+class RecordingOidcProvider:
+    """OIDC ambient-credential double that records the audiences requested."""
+
+    def __init__(
+        self, tokens: t.Optional[t.List[t.Optional[str]]] = None
+    ) -> None:
+        self._tokens = list(tokens or [])
+        self.calls: list[str] = []
+
+    def __call__(self, audience: str) -> t.Optional[str]:
+        self.calls.append(audience)
+        if not self._tokens:
+            raise AssertionError("unexpected OIDC credential request")
+        return self._tokens.pop(0)
+
+
+class MutableClock:
+    """Deterministic clock so renewal decisions never depend on wall time."""
+
+    def __init__(self, now: int) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
+        return self.now
+
+
+def _basic_auth_header(token: str) -> str:
+    return f"Basic {base64.b64encode(f'__token__:{token}'.encode()).decode()}"
+
+
+def _trusted_publishing_resolver(
+    config: utils.RepositoryConfig,
+    session: RecordingSession,
+    oidc_provider: RecordingOidcProvider,
+    clock: MutableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> auth.Resolver:
+    config.update({"repository": utils.TEST_REPOSITORY})
+    monkeypatch.setattr(auth.utils, "make_requests_session", lambda: session)
+    resolver = auth.Resolver(
+        config,
+        auth.CredentialInput(username="__token__"),
+        oidc_token_provider=oidc_provider,
+        clock=clock,
+    )
+    return resolver
+
+
+def _seed_token(resolver: auth.Resolver, token: str, issued_at: int) -> None:
+    resolver._tp_token = auth.TrustedPublishingToken(
+        success=True,
+        token=token,
+        expires=issued_at + 900,
+    )
+    resolver._expires = issued_at + 900
+
+
+def test_get_username_keyring_defers_to_prompt(
+    entered_username, config
+):
+    keyring = RecordingKeyring()
+
+    username = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=keyring
+    ).username
+    assert username == "entered user"
+    assert keyring.get_credential_calls == [("system", None)]
+
+
+def test_get_username_without_keyring_defers_to_prompt(
+    entered_username, config
+):
+    username = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=None
+    ).username
     assert username == "entered user"
 
 
-def test_get_username_keyring_not_installed_defers_to_prompt(
-    monkeypatch, entered_username, config
+def test_get_password_keyring_defers_to_prompt(
+    entered_password, config
 ):
-    monkeypatch.setattr(auth, "keyring", None)
+    keyring = RecordingKeyring()
 
-    username = auth.Resolver(config, auth.CredentialInput()).username
-    assert username == "entered user"
+    pw = auth.Resolver(
+        config, auth.CredentialInput("user"), keyring_backend=keyring
+    ).password
+    assert pw == "entered pw"
+    assert keyring.get_password_calls == [("system", "user")]
 
 
-def test_get_password_keyring_defers_to_prompt(monkeypatch, entered_password, config):
-    class MockKeyring:
-        @staticmethod
-        def get_password(system, user):
-            return None
-
-    monkeypatch.setattr(auth, "keyring", MockKeyring)
-
-    pw = auth.Resolver(config, auth.CredentialInput("user")).password
+def test_get_password_without_keyring_defers_to_prompt(
+    entered_password, config
+):
+    pw = auth.Resolver(
+        config, auth.CredentialInput("user"), keyring_backend=None
+    ).password
     assert pw == "entered pw"
 
 
-def test_get_password_keyring_not_installed_defers_to_prompt(
-    monkeypatch, entered_password, config
-):
-    monkeypatch.setattr(auth, "keyring", None)
-
-    pw = auth.Resolver(config, auth.CredentialInput("user")).password
-    assert pw == "entered pw"
-
-
-def test_no_password_defers_to_prompt(monkeypatch, entered_password, config):
+def test_no_password_defers_to_prompt(entered_password, config):
     config.update(password=None)
-    pw = auth.Resolver(config, auth.CredentialInput("user")).password
+    pw = auth.Resolver(
+        config, auth.CredentialInput("user"), keyring_backend=RecordingKeyring()
+    ).password
     assert pw == "entered pw"
 
 
-def test_empty_password_bypasses_prompt(monkeypatch, entered_password, config):
+def test_empty_password_bypasses_prompt(entered_password, config):
     config.update(password="")
-    pw = auth.Resolver(config, auth.CredentialInput("user")).password
+    pw = auth.Resolver(
+        config, auth.CredentialInput("user"), keyring_backend=RecordingKeyring()
+    ).password
     assert pw == ""
 
 
 def test_no_username_non_interactive_aborts(config):
     with pytest.raises(exceptions.NonInteractive):
-        auth.Private(config, auth.CredentialInput()).username
+        auth.Private(
+            config, auth.CredentialInput(), keyring_backend=RecordingKeyring()
+        ).username
 
 
 def test_no_password_non_interactive_aborts(config):
     with pytest.raises(exceptions.NonInteractive):
-        auth.Private(config, auth.CredentialInput("user")).password
+        auth.Private(
+            config,
+            auth.CredentialInput("user"),
+            keyring_backend=RecordingKeyring(),
+        ).password
 
 
-def test_get_username_and_password_keyring_overrides_prompt(
-    monkeypatch, config, caplog
-):
+def test_get_username_and_password_keyring_overrides_prompt(config, caplog):
     caplog.set_level(logging.INFO, "twine")
 
-    class MockKeyring:
-        @staticmethod
-        def get_credential(system, user):
-            return auth.CredentialInput(
-                "real_user", f"real_user@{system} sekure pa55word"
-            )
+    keyring = RecordingKeyring(
+        credential=auth.CredentialInput(
+            "real_user", "real_user@system sekure pa55word"
+        ),
+        password="real_user@system sekure pa55word",
+    )
 
-        @staticmethod
-        def get_password(system, user):
-            cred = MockKeyring.get_credential(system, user)
-            if user != cred.username:
-                raise RuntimeError("unexpected username")
-            return cred.password
-
-    monkeypatch.setattr(auth, "keyring", MockKeyring)
-
-    res = auth.Resolver(config, auth.CredentialInput())
+    res = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=keyring
+    )
 
     assert res.username == "real_user"
     assert res.password == "real_user@system sekure pa55word"
+
+    assert keyring.get_credential_calls == [("system", None)]
+    assert keyring.get_password_calls == [("system", "real_user")]
 
     assert caplog.messages == [
         "Querying keyring for username",
@@ -117,50 +286,77 @@ def test_get_username_and_password_keyring_overrides_prompt(
     ]
 
 
-@pytest.fixture
-def keyring_missing_get_credentials(monkeypatch):
-    """Simulate keyring prior to 15.2 that does not have the 'get_credential' API."""
-    monkeypatch.delattr(auth.keyring, "get_credential")
+def test_keyring_credentials_are_resolved_only_once(config):
+    """Repeated access must not re-query the keyring for plain credentials."""
+    keyring = RecordingKeyring(
+        credential=auth.CredentialInput("real_user", "real_password"),
+        password="real_password",
+    )
+    res = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=keyring
+    )
 
+    assert res.username == "real_user"
+    assert res.password == "real_password"
+    assert res.username == "real_user"
+    assert res.password == "real_password"
 
-@pytest.fixture
-def entered_username(monkeypatch):
-    monkeypatch.setattr(auth, "input", lambda prompt: "entered user", raising=False)
+    assert len(keyring.get_credential_calls) == 1
+    assert len(keyring.get_password_calls) == 1
+
+    assert isinstance(res.authenticator, requests.auth.HTTPBasicAuth)
+    assert res.authenticator.username == "real_user"
+    assert res.authenticator.password == "real_password"
 
 
 def test_get_username_keyring_missing_get_credentials_prompts(
-    entered_username, keyring_missing_get_credentials, config
+    entered_username, config
 ):
-    assert auth.Resolver(config, auth.CredentialInput()).username == "entered user"
+    keyring = LegacyKeyring()
+
+    assert (
+        auth.Resolver(
+            config, auth.CredentialInput(), keyring_backend=keyring
+        ).username
+        == "entered user"
+    )
 
 
 def test_get_username_keyring_missing_non_interactive_aborts(
-    entered_username, keyring_missing_get_credentials, config
+    entered_username, config
 ):
     with pytest.raises(exceptions.NonInteractive):
-        auth.Private(config, auth.CredentialInput()).username
+        auth.Private(
+            config,
+            auth.CredentialInput(),
+            keyring_backend=LegacyKeyring(),
+        ).username
 
 
 def test_get_password_keyring_missing_non_interactive_aborts(
-    entered_username, keyring_missing_get_credentials, config
+    entered_username, config
 ):
     with pytest.raises(exceptions.NonInteractive):
-        auth.Private(config, auth.CredentialInput("user")).password
+        auth.Private(
+            config,
+            auth.CredentialInput(),
+            keyring_backend=LegacyKeyring(),
+        ).password
 
 
 def test_get_username_keyring_runtime_error_logged(
-    entered_username, monkeypatch, config, caplog
+    entered_username, config, caplog
 ):
-    class FailKeyring:
-        """Simulate missing keyring backend raising RuntimeError on get_credential."""
+    keyring = RecordingKeyring(
+        get_credential_error=lambda: RuntimeError("fail!")
+    )
 
-        @staticmethod
-        def get_credential(system, username):
-            raise RuntimeError("fail!")
-
-    monkeypatch.setattr(auth, "keyring", FailKeyring)
-
-    assert auth.Resolver(config, auth.CredentialInput()).username == "entered user"
+    assert (
+        auth.Resolver(
+            config, auth.CredentialInput(), keyring_backend=keyring
+        ).username
+        == "entered user"
+    )
 
     assert re.search(
         r"Error getting username from keyring.+Traceback.+RuntimeError: fail!",
@@ -170,18 +366,18 @@ def test_get_username_keyring_runtime_error_logged(
 
 
 def test_get_password_keyring_runtime_error_logged(
-    entered_username, entered_password, monkeypatch, config, caplog
+    entered_username, entered_password, config, caplog
 ):
-    class FailKeyring:
-        """Simulate missing keyring backend raising RuntimeError on get_password."""
+    keyring = RecordingKeyring(
+        get_password_error=lambda: RuntimeError("fail!")
+    )
 
-        @staticmethod
-        def get_password(system, username):
-            raise RuntimeError("fail!")
-
-    monkeypatch.setattr(auth, "keyring", FailKeyring)
-
-    assert auth.Resolver(config, auth.CredentialInput()).password == "entered pw"
+    assert (
+        auth.Resolver(
+            config, auth.CredentialInput(), keyring_backend=keyring
+        ).password
+        == "entered pw"
+    )
 
     assert re.search(
         r"Error getting password from keyring.+Traceback.+RuntimeError: fail!",
@@ -199,16 +395,16 @@ def _raise_home_key_error():
 
 
 def test_get_username_keyring_key_error_logged(
-    entered_username, monkeypatch, config, caplog
+    entered_username, config, caplog
 ):
-    class FailKeyring:
-        @staticmethod
-        def get_credential(system, username):
-            _raise_home_key_error()
+    keyring = RecordingKeyring(get_credential_error=_raise_home_key_error)
 
-    monkeypatch.setattr(auth, "keyring", FailKeyring)
-
-    assert auth.Resolver(config, auth.CredentialInput()).username == "entered user"
+    assert (
+        auth.Resolver(
+            config, auth.CredentialInput(), keyring_backend=keyring
+        ).username
+        == "entered user"
+    )
 
     assert re.search(
         r"Error getting username from keyring"
@@ -221,16 +417,16 @@ def test_get_username_keyring_key_error_logged(
 
 
 def test_get_password_keyring_key_error_logged(
-    entered_username, entered_password, monkeypatch, config, caplog
+    entered_username, entered_password, config, caplog
 ):
-    class FailKeyring:
-        @staticmethod
-        def get_password(system, username):
-            _raise_home_key_error()
+    keyring = RecordingKeyring(get_password_error=_raise_home_key_error)
 
-    monkeypatch.setattr(auth, "keyring", FailKeyring)
-
-    assert auth.Resolver(config, auth.CredentialInput()).password == "entered pw"
+    assert (
+        auth.Resolver(
+            config, auth.CredentialInput(), keyring_backend=keyring
+        ).password
+        == "entered pw"
+    )
 
     assert re.search(
         r"Error getting password from keyring"
@@ -245,7 +441,11 @@ def test_get_password_keyring_key_error_logged(
 def test_logs_cli_values(caplog, config):
     caplog.set_level(logging.INFO, "twine")
 
-    res = auth.Resolver(config, auth.CredentialInput("username", "password"))
+    res = auth.Resolver(
+        config,
+        auth.CredentialInput("username", "password"),
+        keyring_backend=RecordingKeyring(),
+    )
 
     assert res.username == "username"
     assert res.password == "password"
@@ -260,7 +460,9 @@ def test_logs_config_values(config, caplog):
     caplog.set_level(logging.INFO, "twine")
 
     config.update(username="username", password="password")
-    res = auth.Resolver(config, auth.CredentialInput())
+    res = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=RecordingKeyring()
+    )
 
     assert res.username == "username"
     assert res.password == "password"
@@ -287,38 +489,42 @@ def test_warns_for_empty_password(
     config,
     caplog,
 ):
-    # Avoiding additional warning "No recommended backend was available"
-    monkeypatch.setattr(auth.keyring, "get_password", lambda system, user: None)
-
     monkeypatch.setattr(getpass, "getpass", lambda prompt: password)
 
-    assert auth.Resolver(config, auth.CredentialInput()).password == password
+    assert (
+        auth.Resolver(
+            config,
+            auth.CredentialInput(),
+            keyring_backend=RecordingKeyring(),
+        ).password
+        == password
+    )
 
     assert caplog.messages[0].startswith(warning)
 
 
-@pytest.mark.skipif(
-    platform.machine() in {"ppc64le", "s390x"},
-    reason="keyring module is optional on ppc64le and s390x",
-)
-def test_keyring_module():
-    assert auth.keyring is not None
-
-
 def test_resolver_authenticator_config_authentication(config):
     config.update(username="username", password="password")
-    res = auth.Resolver(config, auth.CredentialInput())
+    res = auth.Resolver(
+        config, auth.CredentialInput(), keyring_backend=RecordingKeyring()
+    )
     assert isinstance(res.authenticator, requests.auth.HTTPBasicAuth)
 
 
 def test_resolver_authenticator_credential_input_authentication(config):
-    res = auth.Resolver(config, auth.CredentialInput("username", "password"))
+    res = auth.Resolver(
+        config,
+        auth.CredentialInput("username", "password"),
+        keyring_backend=RecordingKeyring(),
+    )
     assert isinstance(res.authenticator, requests.auth.HTTPBasicAuth)
 
 
 def test_resolver_authenticator_trusted_publishing_authentication(config):
     res = auth.Resolver(
-        config, auth.CredentialInput(username="__token__", password="skip-stdin")
+        config,
+        auth.CredentialInput(username="__token__", password="skip-stdin"),
+        keyring_backend=RecordingKeyring(),
     )
     res._tp_token = auth.TrustedPublishingToken(
         success=True,
@@ -327,122 +533,154 @@ def test_resolver_authenticator_trusted_publishing_authentication(config):
     assert isinstance(res.authenticator, auth.TrustedPublishingAuthenticator)
 
 
-class MockResponse:
-    def __init__(self, status_code: int, json: t.Any) -> None:
-        self.status_code = status_code
-        self._json = json
+def test_resolver_without_any_credentials_raises(config):
+    class CredentiallessResolver(auth.Resolver):
+        @property
+        def username(self) -> t.Optional[str]:
+            return None
 
-    def json(self, *args, **kwargs) -> t.Any:
-        return self._json
+        @property
+        def password(self) -> t.Optional[str]:
+            return None
 
-    def raise_for_status(self) -> None:
-        if 400 <= self.status_code:
-            raise requests.exceptions.HTTPError()
-
-    @property
-    def ok(self) -> bool:
-        return self.status_code < 400
-
-
-class MockSession:
-    def __init__(
-        self,
-        get_response_list: t.List[MockResponse],
-        post_response_list: t.List[MockResponse],
-    ) -> None:
-        self.post_counter = self.get_counter = 0
-        self.get_response_list = get_response_list
-        self.post_response_list = post_response_list
-
-    def get(self, url: str, **kwargs) -> MockResponse:
-        response = self.get_response_list[self.get_counter]
-        self.get_counter += 1
-        return response
-
-    def post(self, url: str, **kwargs) -> MockResponse:
-        response = self.post_response_list[self.post_counter]
-        self.post_counter += 1
-        return response
+    with pytest.raises(exceptions.InvalidConfiguration):
+        CredentiallessResolver(
+            config,
+            auth.CredentialInput(),
+            keyring_backend=RecordingKeyring(),
+        ).authenticator
 
 
-def test_trusted_publish_authenticator_refreshes_token(monkeypatch, config):
-    def make_session():
-        return MockSession(
-            get_response_list=[
-                MockResponse(status_code=200, json={"audience": "fake-aud"})
-            ],
-            post_response_list=[
-                MockResponse(
-                    status_code=200,
-                    json={
-                        "success": True,
-                        "token": "new-token",
-                        "expires": int(time.time()) + 900,
-                    },
-                ),
-            ],
-        )
+def test_private_resolver_without_credentials_raises_non_interactive(config):
+    with pytest.raises(exceptions.NonInteractive):
+        auth.Private(
+            config,
+            auth.CredentialInput(),
+            keyring_backend=RecordingKeyring(),
+        ).authenticator
 
-    def detect_credential(*args, **kwargs) -> str:
-        return "fake-oidc-token"
 
-    config.update({"repository": utils.TEST_REPOSITORY})
-    res = auth.Resolver(config, auth.CredentialInput(username="__token__"))
-    res._tp_token = auth.TrustedPublishingToken(
-        success=True,
-        token="expiring-tp-token",
+def test_trusted_publish_authenticator_reuses_token_without_renewal(
+    monkeypatch, config
+):
+    """A token still inside the renewal window must not touch the upstream."""
+    now = 1_000_000
+    clock = MutableClock(now)
+    session = RecordingSession(
+        get_response=MockResponse(200, {"audience": "fake-aud"}),
     )
-    res._expires = int(time.time()) + 4 * 60
-    monkeypatch.setattr(auth, "detect_credential", detect_credential)
-    monkeypatch.setattr(auth.utils, "make_requests_session", make_session)
-    authenticator = auth.TrustedPublishingAuthenticator(resolver=res)
+    oidc = RecordingOidcProvider()
+    resolver = _trusted_publishing_resolver(
+        config, session, oidc, clock, monkeypatch
+    )
+    _seed_token(resolver, "valid-tp-token", issued_at=now)
+
+    authenticator = auth.TrustedPublishingAuthenticator(resolver=resolver)
     prepped_req = requests.models.PreparedRequest()
     prepped_req.prepare_headers({})
+
     request = authenticator(prepped_req)
-    assert (
-        request.headers["Authorization"]
-        == f"Basic {base64.b64encode(b'__token__:new-token').decode()}"
+
+    assert request.headers["Authorization"] == _basic_auth_header(
+        "valid-tp-token"
     )
+    # Nothing was called: the cached token is still fresh.
+    assert session.get_calls == []
+    assert session.post_calls == []
+    assert oidc.calls == []
 
 
-def test_trusted_publish_authenticator_reuses_token(monkeypatch, config):
-    def make_session():
-        return MockSession(
-            get_response_list=[
-                MockResponse(status_code=200, json={"audience": "fake-aud"})
-            ],
-            post_response_list=[
-                MockResponse(
-                    status_code=200,
-                    json={
-                        "success": True,
-                        "token": "new-token",
-                        "expires": int(time.time()) + 900,
-                    },
-                ),
-            ],
-        )
-
-    def detect_credential(*args, **kwargs) -> str:
-        return "fake-oidc-token"
-
-    config.update({"repository": utils.TEST_REPOSITORY})
-    res = auth.Resolver(config, auth.CredentialInput(username="__token__"))
-    res._tp_token = auth.TrustedPublishingToken(
-        success=True,
-        token="valid-tp-token",
+def test_trusted_publish_authenticator_renews_expiring_token(
+    monkeypatch, config
+):
+    """Once the current time enters the renewal window, fetch a new token."""
+    now = 1_000_000
+    clock = MutableClock(now)
+    session = RecordingSession(
+        get_response=MockResponse(200, {"audience": "fake-aud"}),
+        post_responses=[
+            MockResponse(
+                200,
+                {
+                    "success": True,
+                    "token": "new-token",
+                    "expires": now + 900,
+                },
+            )
+        ],
     )
-    res._expires = int(time.time()) + 900
-    monkeypatch.setattr(auth, "detect_credential", detect_credential)
-    monkeypatch.setattr(auth.utils, "make_requests_session", make_session)
-    authenticator = auth.TrustedPublishingAuthenticator(resolver=res)
+    oidc = RecordingOidcProvider(tokens=["fake-oidc-token"])
+    resolver = _trusted_publishing_resolver(
+        config, session, oidc, clock, monkeypatch
+    )
+    # Token issued 11 minutes ago: past the 10 minute renewal threshold.
+    _seed_token(resolver, "expiring-tp-token", issued_at=now - 11 * 60)
+
+    authenticator = auth.TrustedPublishingAuthenticator(resolver=resolver)
     prepped_req = requests.models.PreparedRequest()
     prepped_req.prepare_headers({})
+
     request = authenticator(prepped_req)
-    assert (
-        request.headers["Authorization"]
-        == f"Basic {base64.b64encode(b'__token__:valid-tp-token').decode()}"
+
+    assert request.headers["Authorization"] == _basic_auth_header("new-token")
+    assert len(oidc.calls) == 1
+    assert len(session.get_calls) == 1
+    assert len(session.post_calls) == 1
+    assert session.post_calls[0]["json"] == {"token": "fake-oidc-token"}
+
+    # A second request with time unchanged reuses the freshly minted token.
+    second_prepped = requests.models.PreparedRequest()
+    second_prepped.prepare_headers({})
+    second_request = authenticator(second_prepped)
+    assert second_request.headers["Authorization"] == _basic_auth_header(
+        "new-token"
     )
+    assert len(session.post_calls) == 1
+    assert len(oidc.calls) == 1
+
+
+def test_trusted_publish_renewal_failure_does_not_reuse_old_token(
+    monkeypatch, config
+):
+    """A failed renewal must surface an error and never send the old token."""
+    now = 1_000_000
+    clock = MutableClock(now)
+    session = RecordingSession(
+        get_response=MockResponse(200, {"audience": "fake-aud"}),
+        post_responses=[
+            MockResponse(
+                403,
+                {},
+                error_payload={
+                    "errors": [
+                        {
+                            "code": "invalid-token",
+                            "description": "the OIDC token was rejected",
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    oidc = RecordingOidcProvider(tokens=["fake-oidc-token"])
+    resolver = _trusted_publishing_resolver(
+        config, session, oidc, clock, monkeypatch
+    )
+    _seed_token(resolver, "stale-tp-token", issued_at=now - 11 * 60)
+
+    authenticator = auth.TrustedPublishingAuthenticator(resolver=resolver)
+    prepped_req = requests.models.PreparedRequest()
+    prepped_req.prepare_headers({})
+
+    with pytest.raises(exceptions.TrustedPublishingFailure):
+        authenticator(prepped_req)
+
+    # The renewal really was attempted ...
+    assert len(oidc.calls) == 1
+    assert len(session.post_calls) == 1
+    # ... and nothing attached the previous token to the outgoing request.
+    assert "Authorization" not in prepped_req.headers
+    assert "stale-tp-token" not in prepped_req.headers.get("Authorization", "")
 
 
 def test_inability_to_make_token_raises_error():
@@ -451,7 +689,7 @@ def test_inability_to_make_token_raises_error():
             return None
 
     authenticator = auth.TrustedPublishingAuthenticator(
-        resolver=MockResolver(),
+        resolver=MockResolver(),  # type: ignore[arg-type]
     )
     with pytest.raises(exceptions.TrustedPublishingFailure):
         authenticator(None)

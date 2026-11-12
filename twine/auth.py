@@ -63,11 +63,39 @@ class TrustedPublishingToken(t.TypedDict, total=False):
     expires: t.Optional[int]
 
 
+class KeyringBackend(t.Protocol):
+    """Subset of the ``keyring`` API that credential resolution depends on.
+
+    Tests supply a recording double implementing this protocol instead of
+    touching the real keyring service on the host.
+    """
+
+    def get_credential(
+        self, system: str, username: t.Optional[str]
+    ) -> t.Optional[CredentialInput]: ...
+
+    def get_password(self, system: str, username: str) -> t.Optional[str]: ...
+
+
+class OidcTokenProvider(t.Protocol):
+    def __call__(self, audience: str) -> t.Optional[str]: ...
+
+
+class Clock(t.Protocol):
+    def __call__(self) -> int: ...
+
+
 class TrustedPublishingAuthenticator(requests.auth.AuthBase):
-    def __init__(
-        self,
-        resolver: "Resolver",
-    ) -> None:
+    """HTTP authentication object for trusted publishing (OIDC) uploads.
+
+    This only knows how to attach a minted token to a prepared request.
+    Deciding where the token comes from and when to renew it is the
+    :class:`Resolver`'s responsibility; the authenticator asks the resolver
+    for a token every time a request is prepared and never caches one itself,
+    so a failed renewal can never leak a previous token onto a new request.
+    """
+
+    def __init__(self, resolver: "Resolver") -> None:
         self.resolver = resolver
 
     def __call__(
@@ -89,6 +117,15 @@ class TrustedPublishingAuthenticator(requests.auth.AuthBase):
 
 
 class Resolver:
+    """Resolve the source of credentials for a repository.
+
+    The resolver is the single place that knows about command line input,
+    repository configuration, the keyring, interactive prompts and trusted
+    publishing. It produces plain credentials at most once (the results are
+    cached), and exposes an :class:`requests.auth.AuthBase` object that the
+    HTTP layer can attach to requests without re-running resolution.
+    """
+
     _tp_token: t.Optional[TrustedPublishingToken] = None
     _expires: t.Optional[int] = None
 
@@ -96,23 +133,38 @@ class Resolver:
         self,
         config: utils.RepositoryConfig,
         input: CredentialInput,
+        *,
+        keyring_backend: t.Optional[KeyringBackend] = None,
+        oidc_token_provider: OidcTokenProvider = detect_credential,
+        clock: Clock = lambda: int(time.time()),
     ) -> None:
         self.config = config
         self.input = input
+        # Default to the real keyring module; tests inject a recording double.
+        self.keyring_backend: t.Optional[KeyringBackend] = (
+            keyring if keyring_backend is None else keyring_backend
+        )
+        self.oidc_token_provider = oidc_token_provider
+        self.clock = clock
+
+    @classmethod
+    def choose(cls, interactive: bool) -> t.Type["Resolver"]:
+        return cls if interactive else Private
 
     @property
     @functools.lru_cache()
     def authenticator(self) -> "requests.auth.AuthBase":
+        if self._tp_token:
+            # If the password resolution ended up minting a Trusted Publishing
+            # token, use an authenticator that re-invokes the resolver on every
+            # request, so an expiring token is renewed based on the current
+            # time instead of being frozen into a static Basic Auth object.
+            return TrustedPublishingAuthenticator(resolver=self)
         username = self.username
         password = self.password
-        if self._tp_token:
-            # If `self.password` ended up getting a Trusted Publishing token,
-            # we've cached it here so we should use that as the authenticator.
-            # We have a custom authenticator so we can repeatedly invoke
-            # `make_trusted_publishing_token` which if the token is 10 minutes
-            # old or more, we should get a new one automatically.
-            return TrustedPublishingAuthenticator(resolver=self)
         if username and password:
+            # Plain credentials are resolved once and captured in a single
+            # immutable Basic Auth object.
             return requests.auth.HTTPBasicAuth(
                 username=username,
                 password=password,
@@ -120,10 +172,6 @@ class Resolver:
         raise exceptions.InvalidConfiguration(
             "could not determine credentials for configured repository"
         )
-
-    @classmethod
-    def choose(cls, interactive: bool) -> t.Type["Resolver"]:
-        return cls if interactive else Private
 
     @property
     @functools.lru_cache()
@@ -150,8 +198,10 @@ class Resolver:
         )
 
     def _has_valid_cached_tp_token(self) -> bool:
-        return self._tp_token is not None and (
-            int(time.time()) + TOKEN_RENEWAL_THRESHOLD.seconds
+        if self._tp_token is None:
+            return False
+        return (
+            self.clock() + TOKEN_RENEWAL_THRESHOLD.seconds
             < cast(int, self._tp_token.get("expires", self._expires))
         )
 
@@ -171,7 +221,7 @@ class Resolver:
         audience = cast(str, resp.json()["audience"])
 
         try:
-            oidc_token = detect_credential(audience)
+            oidc_token = self.oidc_token_provider(audience)
         except AmbientCredentialError as e:
             # If we get here, we're on a supported CI platform for trusted
             # publishing, and we have not been given any token, so we can error.
@@ -182,7 +232,7 @@ class Resolver:
 
         if oidc_token is None:
             logger.warning("This environment is not supported for trusted publishing")
-            if self._tp_token and int(time.time()) > cast(
+            if self._tp_token and self.clock() > cast(
                 int, self._tp_token.get("expires", self._expires)
             ):
                 return None  # Fall back to prompting for a token (if possible)
@@ -218,7 +268,7 @@ class Resolver:
 
         logger.warning("Minted upload token for trusted publishing")
         self._tp_token = cast(TrustedPublishingToken, mint_token_payload)
-        self._expires = int(time.time()) + 900
+        self._expires = self.clock() + 900
         return self._tp_token
 
     def make_trusted_publishing_token(self) -> t.Optional[str]:
@@ -232,13 +282,13 @@ class Resolver:
         return self.config["repository"]
 
     def get_username_from_keyring(self) -> t.Optional[str]:
-        if keyring is None:
+        if self.keyring_backend is None:
             logger.info("keyring module is not available")
             return None
         try:
             system = cast(str, self.system)
             logger.info("Querying keyring for username")
-            creds = keyring.get_credential(system, None)
+            creds = self.keyring_backend.get_credential(system, None)
             if creds:
                 return creds.username
         except AttributeError:
@@ -249,14 +299,14 @@ class Resolver:
         return None
 
     def get_password_from_keyring(self) -> t.Optional[str]:
-        if keyring is None:
+        if self.keyring_backend is None:
             logger.info("keyring module is not available")
             return None
         try:
             system = cast(str, self.system)
             username = cast(str, self.username)
             logger.info("Querying keyring for password")
-            return cast(str, keyring.get_password(system, username))
+            return cast(str, self.keyring_backend.get_password(system, username))
         except NoKeyringError:
             logger.info("No keyring backend found")
         except Exception as exc:
